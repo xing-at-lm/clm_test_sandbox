@@ -1,0 +1,15 @@
+.DS_Store
+
+*.egg-info/
+.coverage
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+dist/
+logs/
+venv/
+
+.vscode/
+**/*.csv
+**/*.png

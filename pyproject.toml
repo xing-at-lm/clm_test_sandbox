@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clm-test-sandbox"
+version = "0.1.0"
+description = "Local sandbox for CLM scripts that use instrument-drivers and cmis-host-controller."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clm_test_sandbox*"]

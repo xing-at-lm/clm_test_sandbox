@@ -1,0 +1,5 @@
+# Editable installs of the sibling checkouts. Local edits in those repos
+# are importable from this sandbox without a reinstall.
+-e ../cmis-host-controller
+-e ../instrument-drivers
+-e .

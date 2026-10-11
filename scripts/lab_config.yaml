@@ -1,0 +1,45 @@
+# Hardware addresses and default setpoints for the CLM PER lab.
+# Edit this file when the bench changes. Test cells read it through clm_experiments.load_config.
+
+data_dir: C:\Users\MountainViewLabUser\xingpan\testdata
+tile_index: 3
+test_board_type: EVK # CLM-M, CNT, EVK
+
+aardvark:
+  p0: 2239867798
+  io: 2239880394
+  p1: 2239789566
+
+firmware:
+  dir: C:\Users\MountainViewLabUser\gitrepos\clm_bin_files\bin_files
+  filename: clm_rel_marlow_tile_v1.12.bin
+
+per_meter_port: COM5
+arroyo_port: COM3
+dmm_visa: USB0::0x2A8D::0xB318::MY65070041::INSTR
+psu_visa: USB0::0x2A8D::0x1202::MY61007909::INSTR
+
+thorlabs_sdk: C:\Program Files (x86)\Thorlabs\PTC1\Sample\Thorlabs_PTC1_PythonSDK
+
+tec_thorlab:
+  baud: 115200
+  timeout: 3
+  target_mC: 32000
+
+thermal:
+  target_c: 32.0
+  interval_s: 15
+  kp: 0.1
+  ki: 0.001
+  kd: 0.0
+
+control:
+  dither_period_s: 2
+  kp_tpic: 0.3
+  kp_ld: 0.3
+  kp_voa: 0.3
+  amp_t_mux: 3
+  alpha_i_ld: 0.5
+
+# Previously collected overnight run, used by the offline plot cell.
+overnight_csv: C:\Users\MountainViewLabUser\xingpan\testdata\ch5 overnight per and temp_with fiber and clm case TC at 32C_4-30-2026.csv
