@@ -101,24 +101,120 @@ def plot_thermal_check(df_or_path, kp, ki, kd, interval_s):
     return frame
 
 
-def plot_per_vs_temperature(df_or_path):
+def plot_per_meter_cal(df_or_path):
+    """PER and angle versus time and temperature, then PER versus angle."""
     frame = _load(df_or_path)
-    fig, ax = plt.subplots(3, 1, figsize=(8, 10))
-    sns.lineplot(data=frame, x="et_min", y="temp", hue="ch", palette="bright", ax=ax[0])
-    sns.lineplot(data=frame, x="et_min", y="per_dB", linestyle="-", marker="", hue="ch", palette="bright", ax=ax[1])
-    sns.lineplot(data=frame, x="et_min", y="theta", hue="ch", palette="bright", ax=ax[2])
-    ax[2].set_xlabel("et_min")
+    fig, ax = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+    sns.lineplot(data=frame, x="et_min", y="temp", ax=ax[0])
+    sns.lineplot(data=frame, x="et_min", y="per_dB", ax=ax[1])
+    sns.lineplot(data=frame, x="et_min", y="theta", ax=ax[2])
+    ax[0].set_ylabel("temp (C)")
+    ax[1].set_ylabel("PER (dB)")
+    ax[2].set_ylabel("polarization angle (deg)")
+    ax[2].set_xlabel("elapsed time (min)")
+    for axis in ax:
+        axis.grid(True)
+    fig.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+    sns.lineplot(data=frame, x="temp", y="per_dB", ax=ax[0])
+    sns.lineplot(data=frame, x="temp", y="theta", ax=ax[1])
+    ax[0].set_ylabel("PER (dB)")
+    ax[1].set_ylabel("polarization angle (deg)")
+    ax[1].set_xlabel("temp (C)")
     for axis in ax:
         axis.grid(True)
     fig.tight_layout()
     plt.show()
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    sns.scatterplot(data=frame, x="theta", y="per_dB", hue="ch", marker="o", palette="bright", ax=ax)
+    sns.scatterplot(data=frame, x="theta", y="per_dB", marker="o", ax=ax)
+    ax.set_xlabel("polarization angle (deg)")
+    ax.set_ylabel("PER (dB)")
     ax.grid(True)
     fig.tight_layout()
     plt.show()
     return frame
+
+
+def plot_per_vs_temperature(
+    df_or_path,
+    output_dir=None,
+    file_stem="per_vs_temperature",
+    show=True,
+):
+    """PER / theta / temp versus time, then PER versus theta.
+
+    When ``output_dir`` is set, saves:
+      ``{file_stem}_time.png`` and ``{file_stem}_theta.png``.
+    """
+    frame = _load(df_or_path)
+    if "et_min" not in frame.columns and "et_0" in frame.columns:
+        frame["et_min"] = frame["et_0"] / 60.0
+    if "et_min" not in frame.columns and "et_s" in frame.columns:
+        frame["et_min"] = frame["et_s"] / 60.0
+    # Arroyo-only runs may leave temp_thorlab empty; prefer temp then temp_arroyo.
+    temp_col = "temp"
+    if temp_col not in frame.columns or frame[temp_col].isna().all():
+        if "temp_arroyo" in frame.columns:
+            temp_col = "temp_arroyo"
+
+    out = Path(output_dir) if output_dir is not None else None
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(3, 1, figsize=(8, 10))
+    sns.lineplot(
+        data=frame, x="et_min", y=temp_col, hue="ch", palette="bright", ax=ax[0]
+    )
+    sns.lineplot(
+        data=frame,
+        x="et_min",
+        y="per_dB",
+        linestyle="-",
+        marker="",
+        hue="ch",
+        palette="bright",
+        ax=ax[1],
+    )
+    sns.lineplot(
+        data=frame, x="et_min", y="theta", hue="ch", palette="bright", ax=ax[2]
+    )
+    ax[0].set_ylabel("temp (C)")
+    ax[1].set_ylabel("PER (dB)")
+    ax[2].set_ylabel("theta (deg)")
+    ax[2].set_xlabel("et_min")
+    for axis in ax:
+        axis.grid(True)
+    fig.tight_layout()
+    paths = []
+    if out is not None:
+        path_time = out / f"{file_stem}_time.png"
+        fig.savefig(path_time, dpi=150)
+        paths.append(path_time)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.scatterplot(
+        data=frame, x="theta", y="per_dB", hue="ch", marker="o", palette="bright", ax=ax
+    )
+    ax.set_xlabel("polarization angle (deg)")
+    ax.set_ylabel("PER (dB)")
+    ax.grid(True)
+    fig.tight_layout()
+    if out is not None:
+        path_theta = out / f"{file_stem}_theta.png"
+        fig.savefig(path_theta, dpi=150)
+        paths.append(path_theta)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return frame if not paths else (frame, paths)
 
 
 def plot_per_vs_frequency(df_or_path):

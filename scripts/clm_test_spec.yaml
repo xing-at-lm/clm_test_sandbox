@@ -1,0 +1,14 @@
+# CLM acceptance-test product and firmware specification.
+# Edit limits and the firmware binary when the product or build changes.
+
+firmware:
+  dir: C:\Users\MountainViewLabUser\gitrepos\clm_bin_files\bin_files
+  filename: clm_rel_marlow_tile_v1.14.bin
+
+# Pass/fail limits. Each error/stability/PER entry is [low, high] inclusive, then unit.
+clm_test_spec:
+  target_power: 8          # mW per channel
+  wavelength_error: [[-0.1, 0.1], nm]
+  power_error: [[-0.2, 0.2], dB]
+  power_stability: [[0, 0.1], dB]   # 15 min, 3-sigma
+  PER: [[15, 99], dB]              # minimum PER

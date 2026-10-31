@@ -167,7 +167,10 @@ def get_fru_full(tile):
     x=tile.flash_read_fru_setpoints()
     v_fru.update({'bias_currents':x.bias_currents,
                   'temp_pic':x.temp_pic,
-                  'temp_mux':x.temp_mux})
+                  'temp_mux':x.temp_mux,
+                  'pic_mpd_currents': list(x.pic_mpd_currents),
+                  'mux_mpd_currents': list(x.mux_mpd_currents),
+                  'mux_mpd_gain_settings': list(x.mux_mpd_gain_settings)})
     
     
     x=tile.flash_read_fru_optical_measurements()
@@ -211,59 +214,52 @@ def reinitialize_bootloader(tb,dir_fw,filename_fw,idxTiles=[3,4]):
 
 
 
-def initialize_tile(tb,tile=None):
-    if tile==None:
+def _configure_tile_low_power(tile_i, tile_idx="?"):
+    """Fault masks, dither defaults, low-power, and power/freq setpoints (no software_reset)."""
+    tile_i.write_mask_optical_fault_passive(1)
+    tile_i.write_mask_optical_fault_active(1)
+    tile_i.write_self_test_s(0)
+    tile_i.write_stabilization_amplitude(stab_amplitude)
+    tile_i.write_stabilization_period(stab_period)
+    tile_i.write_low_pwr_req_s(1)
+    for b, bank in enumerate(ClmTile.Bank):
+        try:
+            tile_i.write_optical_power_setpoints(bank, [pwr_setpoint] * ClmTile.NUM_LANES_PER_BANK)
+        except Exception as e:
+            print(f"ERROR: Failed to set power setpoint for Tile {tile_idx}.{bank}: {e}")
+        try:
+            bank_setpoints = freq_setpoint[(b * ClmTile.NUM_LANES_PER_BANK):((b + 1) * ClmTile.NUM_LANES_PER_BANK)]
+            tile_i.write_lane_frequency_setpoints(bank, bank_setpoints)
+        except Exception as e:
+            print(f"ERROR: Failed to set frequency setpoint for Tile {tile_idx}.{bank}: {e}")
+
+
+def initialize_tile(tb, tile=None, software_reset=True):
+    """Bring tile(s) to low-power with default setpoints.
+
+    ``software_reset=False`` skips CMIS SoftwareReset (use after a board
+    hardware reset + tile.reopen() when SoftwareReset hits I2C -103).
+    """
+    if tile is None:
         for _, tile_idx, tile_i in tb.module.iter_tiles(indices=True):
             print(tile_idx)
             print(tile_i)
             if not isinstance(tile_i, ClmTileMarlow):
-                raise TypeError(f"Expected tile of type {ClmTileMarlow.__name__} but encountered {type(tile).__name__}")
-            tile_i.software_reset()
-            tile_i.write_mask_optical_fault_passive(1)
-            tile_i.write_mask_optical_fault_active(1)
-            tile_i.write_self_test_s(0)
-        
-            # Set stabilization parameters
-            tile_i.write_stabilization_amplitude(stab_amplitude)
-            tile_i.write_stabilization_period(stab_period)
-        
-            # Transition to Low power
-            tile_i.write_low_pwr_req_s(1)
-            for b, bank in enumerate(ClmTile.Bank):
-                try:
-                    tile_i.write_optical_power_setpoints(bank, [pwr_setpoint] * ClmTile.NUM_LANES_PER_BANK)
-                except Exception as e:
-                    print(f"ERROR: Failed to set power setpoint for Tile {tile_idx}.{bank}: {e}")
-                try:
-                    bank_setpoints = freq_setpoint[(b * ClmTile.NUM_LANES_PER_BANK):((b + 1) * ClmTile.NUM_LANES_PER_BANK)]
-                    tile_i.write_lane_frequency_setpoints(bank, bank_setpoints)
-                except Exception as e:
-                    print(f"ERROR: Failed to set frequency setpoint for Tile {tile_idx}.{bank}: {e}")
+                raise TypeError(
+                    f"Expected tile of type {ClmTileMarlow.__name__} but encountered {type(tile_i).__name__}"
+                )
+            if software_reset:
+                tile_i.software_reset()
+            _configure_tile_low_power(tile_i, tile_idx=tile_idx)
     else:
-        tile_i=tile
+        tile_i = tile
         if not isinstance(tile_i, ClmTileMarlow):
-            raise TypeError(f"Expected tile of type {ClmTileMarlow.__name__} but encountered {type(tile).__name__}")
-        tile_i.software_reset()
-        tile_i.write_mask_optical_fault_passive(1)
-        tile_i.write_mask_optical_fault_active(1)
-        tile_i.write_self_test_s(0)
-    
-        # Set stabilization parameters
-        tile_i.write_stabilization_amplitude(stab_amplitude)
-        tile_i.write_stabilization_period(stab_period)
-    
-        # Transition to Low power
-        tile_i.write_low_pwr_req_s(1)
-        for b, bank in enumerate(ClmTile.Bank):
-            try:
-                tile_i.write_optical_power_setpoints(bank, [pwr_setpoint] * ClmTile.NUM_LANES_PER_BANK)
-            except Exception as e:
-                print(f"ERROR: Failed to set power setpoint for Tile {tile_idx}.{bank}: {e}")
-            try:
-                bank_setpoints = freq_setpoint[(b * ClmTile.NUM_LANES_PER_BANK):((b + 1) * ClmTile.NUM_LANES_PER_BANK)]
-                tile_i.write_lane_frequency_setpoints(bank, bank_setpoints)
-            except Exception as e:
-                print(f"ERROR: Failed to set frequency setpoint for Tile {tile_idx}.{bank}: {e}")       
+            raise TypeError(
+                f"Expected tile of type {ClmTileMarlow.__name__} but encountered {type(tile).__name__}"
+            )
+        if software_reset:
+            tile_i.software_reset()
+        _configure_tile_low_power(tile_i, tile_idx="?")
     return 0
 
 def optical_power_on(tile):        
@@ -416,13 +412,15 @@ def load_config_data_from_yaml(tile,yamlDir,yamlFile,powerTragets,freqOffsetTarg
     voa_current_old = copy.deepcopy(data_prev['current']['voa'])
     initVOAcurrents=list(np.array(voa_current_old)+np.array(initVOAOffsets))
     #voa_current_old = [15]*16
+    existing = get_fru_full(tile)
     tile.flash_write_fru_app_settings(voa_currents=initVOAcurrents, power_targets=POWER_TARGETS, freq_error_targets=FREQ_TARGETS)
     tile.flash_write_fru_optical_measurements(pic_tap_ratios, mux_tap_ratios, mux_freq_errors)
     tile.flash_write_fru_setpoints(temp_pic,
                                   temp_mux,
                                   bias_currents.tolist(),
-                                  [0]*16,
-                                  [0]*16)
+                                  list(existing.get("pic_mpd_currents") or [0]*16),
+                                  list(existing.get("mux_mpd_currents") or [0]*16),
+                                  list(existing.get("mux_mpd_gain_settings") or [0]*16))
     tile.software_reset() 
 
 def write_new_fru_data(tile,dict_fru_revised):    
@@ -435,14 +433,18 @@ def write_new_fru_data(tile,dict_fru_revised):
     POWER_TARGETS=dict_fru_revised['power_targets']
     FREQ_TARGETS=dict_fru_revised['freq_error_targets']
     mux_freq_errors=[40]*16
+    pic_mpd_currents = list(dict_fru_revised.get("pic_mpd_currents") or [0]*16)
+    mux_mpd_currents = list(dict_fru_revised.get("mux_mpd_currents") or [0]*16)
+    mux_mpd_gain_settings = list(dict_fru_revised.get("mux_mpd_gain_settings") or [0]*16)
     #voa_current_old = [15]*16
     tile.flash_write_fru_app_settings(voa_currents=initVOAcurrents, power_targets=POWER_TARGETS, freq_error_targets=FREQ_TARGETS)
     tile.flash_write_fru_optical_measurements(pic_tap_ratios, mux_tap_ratios, mux_freq_errors)
     tile.flash_write_fru_setpoints(temp_pic,
                                   temp_mux,
                                   bias_currents.tolist(),
-                                  [0]*16,
-                                  [0]*16)
+                                  pic_mpd_currents,
+                                  mux_mpd_currents,
+                                  mux_mpd_gain_settings)
     tile.software_reset() 
 
 if __name__=='__main__':

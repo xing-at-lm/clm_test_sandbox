@@ -131,8 +131,81 @@ tec_thorlab = clm_exp.open_ptc(cfg)
 # %% open PER meter
 per_meter = clm_exp.open_per_meter(cfg)
 
+# %% open ER-100 PER meter
+per_meter_er100 = clm_exp.open_per_meter_er100(cfg)
+
+# %% PER meter calibration
+# Ramp the Thorlabs TEC temp0 -> temp1 -> temp0 while recording the ER-100.
+df = clm_exp.per_meter_cal(
+    tec_thorlab,
+    per_meter_er100,
+    DATA_DIR,
+    temp0=25,
+    temp1=45,
+    ramp_time_s=1200,
+    note="",
+)
+plots.plot_per_meter_cal(df)
+
 # %% open Arroyo TEC
 tec_arroyo = clm_exp.open_arroyo(cfg)
+
+# %% open OSA
+osa = clm_exp.open_osa(cfg)
+
+#%%
+clm_exp.apply_control_config(
+    tile,
+    dither_period_s=2,
+    kp_tpic=0.2,
+    kp_ld=0.2,
+    kp_voa=0.2,
+    alpha_i_ld=0.5,
+    amp_t_mux=3)
+# %% CLM to OSA loss calibration
+dict_results = clm_exp.clm_to_OSA_loss_cal(tile, osa)
+
+# %% CLM power and wavelength stability
+df = clm_exp.clm_power_n_wavelength_stability(
+    tile,
+    osa,
+    dict_results["clm_osa_loss_A"],
+    dict_results["clm_osa_loss_B"],
+    test_duration=60 * 15,
+    sample_interval=10,
+    trace="TRA",
+    idx_tile=cfg["tile_index"],
+)
+
+# %% CLM power and wavelength stability report
+# Uses the stability df above. Min PER is left out; this df has no PER samples.
+import importlib
+from datetime import datetime
+import generate_clm_test_report as clm_report
+importlib.reload(clm_report)
+
+stability_spec = {
+    name: clm_report.spec_config_dict[name]
+    for name in (
+        "wavelength error",
+        "power error",
+        "15 min power stability",
+    )
+}
+stability_results = clm_exp.summarize_clm_stability(df, power_tgt_mw=8)
+dict_test = {
+    "test date": datetime.now().strftime("%m/%d/%Y"),
+    "tester": "xing pan",
+    "target power": "8 mW/ch",
+}
+dut = {"Serial Number": sn, "Part Number": "2120000153"}
+report_paths = clm_report.generate_clm_test_report(
+    dict_test,
+    dut,
+    stability_spec,
+    results=stability_results,
+    output_dir=DATA_DIR,
+)
 
 # %% wait for the case to settle
 # time.sleep(3600)
@@ -198,6 +271,61 @@ df = clm_exp.per_over_temp_3(
     note="",
 )
 plots.plot_per_vs_temperature(df)
+
+# %% CLM port A and port B PER test
+# Disables every lane, prompts for port A, runs per_over_temp_3, then port B.
+import importlib
+from datetime import datetime
+importlib.reload(clm_exp)
+df_per = clm_exp.clm_per_test(
+    tile,
+    tec_thorlab,
+    tec_arroyo,
+    per_meter,
+    DATA_DIR,
+    channels=range(8),
+    temp0=30,
+    temp1=36,
+    channel_settle_s=20,
+    channel_s=600,
+    tile_index=cfg["tile_index"],
+    note="",
+)
+per_summary = clm_exp.channel_min_per(df_per)
+
+import generate_clm_test_report as clm_report
+importlib.reload(clm_report)
+if "stability_results" in globals():
+    report_results = stability_results.merge(
+        per_summary, on=["tile", "bank", "channel"], how="outer"
+    )
+else:
+    report_results = per_summary
+
+report_spec = {
+    name: clm_report.spec_config_dict[name]
+    for name in (
+        "wavelength error",
+        "power error",
+        "15 min power stability",
+        "min PER",
+    )
+    if name in report_results.columns
+}
+
+dict_test = {
+    "test date": datetime.now().strftime("%m/%d/%Y"),
+    "tester": "xing pan",
+    "target power": "8 mW/ch",
+}
+dut = {"Serial Number": sn, "Part Number": "2120000153"}
+report_paths = clm_report.generate_clm_test_report(
+    dict_test,
+    dut,
+    report_spec,
+    results=report_results,
+    output_dir=DATA_DIR,
+)
 
 # %% PER versus frequency offset
 df = clm_exp.per_vs_frequency_offset(

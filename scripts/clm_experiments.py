@@ -32,11 +32,22 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import marlow_clm_control_api as mca
+from three_dB_coupler_T191134 import coupler_insertion_loss_db as c3db_loss
 
 N_LANES = 16
 LANES_PER_BANK = 8
 PER_FIELDS = ("per_dB", "theta", "pow")
 
+# Interleaved CLM grid from clm_tile_control_kurtz.py. Even entries are bank A.
+WAVELENGTH_GRID_NM = np.array([
+    1301.47, 1302.60, 1303.73, 1304.87,
+    1306.01, 1307.14, 1308.28, 1309.43,
+    1310.57, 1311.72, 1312.87, 1314.02,
+    1315.17, 1316.33, 1317.48, 1318.64,
+])
+
+WAVELENGTH_GRID_NM_A=WAVELENGTH_GRID_NM[0::2]
+WAVELENGTH_GRID_NM_B=WAVELENGTH_GRID_NM[1::2]
 
 def load_config(path=None):
     """Load lab_config.yaml from scripts/, or from path."""
@@ -46,13 +57,122 @@ def load_config(path=None):
         return yaml.safe_load(handle)
 
 
+def load_test_spec(path=None):
+    """Load clm_test_spec.yaml from scripts/, or from path."""
+    if path is None:
+        path = Path(__file__).resolve().parent / "clm_test_spec.yaml"
+    with open(path, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def clm_fw_update(tile, spec=None, note=""):
+    """Flash firmware named in clm_test_spec.yaml onto one tile.
+
+    Uses ``tile.firmware_update`` (per-tile, not board-wide).
+    ``spec`` may be the loaded YAML dict, or None to load clm_test_spec.yaml.
+    Returns the absolute path of the binary that was programmed.
+    """
+    if tile is None:
+        raise ValueError("tile handle is required for firmware update")
+    if spec is None:
+        spec = load_test_spec()
+    firmware = spec.get("firmware") if isinstance(spec, dict) else None
+    if not firmware or "dir" not in firmware or "filename" not in firmware:
+        raise ValueError("clm_test_spec.yaml must define firmware.dir and firmware.filename")
+    fw_dir = Path(firmware["dir"])
+    fw_name = firmware["filename"]
+    fw_path = fw_dir / fw_name
+    if not fw_path.is_file():
+        raise FileNotFoundError(f"Firmware binary not found: {fw_path}")
+    print(f"Updating tile firmware from {fw_path}" + (f" ({note})" if note else ""))
+    tile.firmware_update(str(fw_path))
+    print(f"Firmware update finished: {fw_name}")
+    return fw_path
+
+
 def _scripts_on_path():
     scripts_dir = str(Path(__file__).resolve().parent)
     if scripts_dir not in sys.path:
         sys.path.append(scripts_dir)
 
 
-def connect_testboard(cfg):
+def _tile_inventory(tb):
+    """Return list of (tile_index, tile) for non-None package-0 tiles."""
+    package = tb.module.packages[0]
+    return [
+        (idx, tile)
+        for idx, tile in enumerate(package.tiles)
+        if tile is not None
+    ]
+
+
+def reopen_package_tiles(tb, log=print):
+    """Reopen package MCI then every present tile (required after reset / bus errors)."""
+    package = tb.module.packages[0]
+    log("Reopening package MCI + all present tiles...")
+    package.reopen()
+    time.sleep(0.3)
+
+
+def probe_tile_link(tile, label="tile", log=print):
+    """True if tile answers read_fw_version."""
+    try:
+        version = tile.read_fw_version()
+        log(f"{label} reachable, FW version: {version}")
+        return True
+    except Exception as exc:
+        log(f"{label} probe failed: {exc}")
+        return False
+
+
+def ensure_tile_ready(tb, tile_index, log=print):
+    """Return a live tile handle for tile_index, or raise with inventory details."""
+    package = tb.module.packages[0]
+    present = _tile_inventory(tb)
+    log(
+        "Present tiles at connect: "
+        + (
+            ", ".join(
+                f"{idx}(addr={getattr(tile, 'dev_addr', None)})"
+                for idx, tile in present
+            )
+            or "(none)"
+        )
+    )
+    if tile_index is None:
+        raise ValueError("tile_index is required")
+    tile_index = int(tile_index)
+    if tile_index < 0 or tile_index >= len(package.tiles):
+        raise IndexError(f"tile_index {tile_index} out of range for package.tiles")
+
+    tile = package.tiles[tile_index]
+    if tile is None:
+        raise RuntimeError(
+            f"tiles[{tile_index}] is empty (no CLM at that address slot). "
+            f"Present indices: {[idx for idx, _ in present]}"
+        )
+
+    reopen_package_tiles(tb, log=log)
+    tile = package.tiles[tile_index]
+    if probe_tile_link(tile, label=f"tile {tile_index}", log=log):
+        return tile
+
+    log(f"tile {tile_index} not reachable; hardware-reset all tiles and reopen...")
+    tb.reset_tiles(0xFF)
+    time.sleep(0.5)
+    reopen_package_tiles(tb, log=log)
+    tile = package.tiles[tile_index]
+    if tile is not None and probe_tile_link(tile, label=f"tile {tile_index}", log=log):
+        return tile
+
+    raise RuntimeError(
+        f"tile {tile_index} not responding after package reopen / full reset. "
+        f"Present slots: {[idx for idx, _ in _tile_inventory(tb)]}. "
+        "Confirm DUT is seated, EVK regulators are on, and only one GUI holds the Aardvark."
+    )
+
+
+def connect_testboard(cfg, log=print):
     """Open the testboard named in cfg and return (testboard, tile)."""
     tb = mca.get_testboard(
         AARDVARK_SN_P0=cfg["aardvark"]["p0"],
@@ -60,8 +180,114 @@ def connect_testboard(cfg):
         AARDVARK_SN_P1=cfg["aardvark"]["p1"],
         testBoardType=cfg["test_board_type"],
     )
-    tile = tb.module.packages[0].tiles[cfg["tile_index"]]
+    tile_index = int(cfg.get("tile_index", 3))
+    tile = ensure_tile_ready(tb, tile_index, log=log)
     return tb, tile
+
+
+def _open_station_testboard(cfg):
+    log = cfg.get("_station_log", print)
+    tb, tile = connect_testboard(cfg, log=log)
+    return {"tb": tb, "tile": tile}
+
+
+def _close_station_testboard(handle):
+    tb = handle.get("tb") if isinstance(handle, dict) else None
+    if tb is not None:
+        mca.shut_down_test_board_nicely(tb)
+
+
+def _close_station_instrument(obj):
+    if obj is None:
+        return
+    close = getattr(obj, "close", None)
+    if callable(close):
+        close()
+
+
+def _station_handlers():
+    """Open/close pairs for lab_config.test_station.instruments.
+
+    Add a new instrument here, then list its name under test_station in YAML.
+    """
+    return {
+        "testboard": (_open_station_testboard, _close_station_testboard),
+        "tec_thorlab": (open_ptc, _close_station_instrument),
+        "tec_arroyo": (open_arroyo, _close_station_instrument),
+        "per_meter": (open_per_meter, _close_station_instrument),
+        "per_meter_er100": (open_per_meter_er100, _close_station_instrument),
+        "osa": (open_osa, _close_station_instrument),
+    }
+
+
+def clm_start_test_station(cfg, log=print):
+    """Open every instrument listed under cfg['test_station']['instruments'].
+
+    Returns a dict name -> open handle for instruments that opened successfully.
+    A failure on one instrument is logged and skipped so the others stay usable.
+    Raises only when the instrument list is missing, or when every open fails.
+    """
+    handlers = _station_handlers()
+    names = list(cfg.get("test_station", {}).get("instruments", []))
+    if not names:
+        raise ValueError("lab_config.yaml has no test_station.instruments list")
+    log(f"Starting test station: {', '.join(names)}")
+    # So connect_testboard / ensure_tile_ready messages appear in the GUI log.
+    cfg = dict(cfg)
+    cfg["_station_log"] = log
+    instruments = {}
+    failures = {}
+    for name in names:
+        if name not in handlers:
+            failures[name] = KeyError(
+                f"Unknown instrument {name!r}. Register it in _station_handlers()."
+            )
+            log(f"  {name} failed: {failures[name]}")
+            continue
+        open_fn, _ = handlers[name]
+        log(f"  opening {name} ...")
+        try:
+            instruments[name] = open_fn(cfg)
+            log(f"  {name} ready")
+        except Exception as exc:
+            failures[name] = exc
+            log(f"  {name} failed: {exc}")
+    if not instruments:
+        detail = "; ".join(f"{name}: {exc}" for name, exc in failures.items())
+        raise RuntimeError(f"No test-station instruments opened. {detail}")
+    if failures:
+        log(
+            f"Test station partial start. Ready: {', '.join(instruments)}. "
+            f"Failed: {', '.join(failures)}."
+        )
+    else:
+        log("Test station started.")
+    return instruments
+
+
+def clm_close_test_station(instruments, log=print):
+    """Close every instrument in the dict, newest first.
+
+    ``instruments`` is the dict returned by clm_start_test_station. Entries
+    are removed from the dict as they are closed.
+    """
+    if not instruments:
+        log("Test station is already closed.")
+        return
+    handlers = _station_handlers()
+    names = list(reversed(list(instruments.keys())))
+    log(f"Closing test station: {', '.join(names)}")
+    for name in names:
+        handle = instruments.pop(name, None)
+        if handle is None:
+            continue
+        _, close_fn = handlers.get(name, (None, _close_station_instrument))
+        try:
+            close_fn(handle)
+            log(f"  closed {name}")
+        except Exception as exc:
+            log(f"  warning closing {name}: {exc}")
+    log("Test station closed.")
 
 
 def apply_control_config(
@@ -414,6 +640,14 @@ def open_per_meter(cfg):
     return oz_er1000.ER1000(cfg["per_meter_port"])
 
 
+def open_per_meter_er100(cfg):
+    """Open the OZ Optics ER-100 at the configured COM port."""
+    _scripts_on_path()
+    import oz_er100
+
+    return oz_er100.ER100(cfg["per_meter_er100_port"])
+
+
 def open_arroyo(cfg):
     """Open the Arroyo TEC on the configured COM port and print its status.
 
@@ -432,9 +666,21 @@ def open_arroyo(cfg):
     return tec_arroyo
 
 
+def open_osa(cfg):
+    """Open the Yokogawa OSA at the configured VISA address."""
+    from instrument_drivers.devices.yokogawa_osa import YokogawaOSA
+
+    return YokogawaOSA(cfg["osa_visa"])
+
+
 def set_temperature(tec_thorlab, tec_arroyo, temp_c):
     """Set the same target, in degrees C, on both TECs."""
     tec_thorlab.set_target_temperature(int(round(1000 * temp_c)))
+    tec_arroyo.set_temp(float(temp_c))
+
+
+def set_temperature_arroyo(tec_arroyo, temp_c):
+    """Set Arroyo TEC target only (degrees C)."""
     tec_arroyo.set_temp(float(temp_c))
 
 
@@ -456,6 +702,54 @@ def read_tec_state(tec_thorlab, tec_arroyo):
         "curr_arroyo": tec_arroyo.get_curr(),
         "volt_arroyo": tec_arroyo.get_volt(),
     }
+
+
+def read_tec_state_arroyo(tec_arroyo):
+    """Read Arroyo TEC only; Thorlabs columns left as NaN for CSV compatibility."""
+    temp_arroyo = tec_arroyo.get_temp()
+    return {
+        "temp": temp_arroyo,
+        "temp_thorlab": float("nan"),
+        "curr_thorlab": float("nan"),
+        "volt_thorlab": float("nan"),
+        "temp_arroyo": temp_arroyo,
+        "curr_arroyo": tec_arroyo.get_curr(),
+        "volt_arroyo": tec_arroyo.get_volt(),
+    }
+
+
+def _reading_power(reading):
+    """ER-1000 uses power_dbm; ER-100 uses relative power_db."""
+    if hasattr(reading, "power_dbm"):
+        return reading.power_dbm
+    return getattr(reading, "power_db", float("nan"))
+
+
+def _collect_er_both(meter_a, meter_b, duration_s):
+    """Read both PER meters for duration_s in parallel. Returns (list_a, list_b)."""
+    import threading
+
+    buckets = {"A": [], "B": []}
+    errors = {}
+
+    def _worker(key, meter):
+        try:
+            buckets[key] = list(meter.iter_er(duration_s))
+        except Exception as exc:
+            errors[key] = exc
+
+    threads = [
+        threading.Thread(target=_worker, args=("A", meter_a), daemon=True),
+        threading.Thread(target=_worker, args=("B", meter_b), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        detail = "; ".join(f"{key}: {exc}" for key, exc in errors.items())
+        raise RuntimeError(f"PER meter read failed: {detail}")
+    return buckets["A"], buckets["B"]
 
 
 def _now():
@@ -839,6 +1133,118 @@ def per_over_temp_3(
     return frame
 
 
+def _set_thorlab_temperature(tec_thorlab, temp_c):
+    tec_thorlab.set_target_temperature(int(round(1000 * temp_c)))
+
+
+def _read_thorlab_state(tec_thorlab):
+    """Read the Thorlabs TEC. Temperature, current, and voltage are in C, A, and V."""
+    temp_mC = [0]
+    curr_thorlab = [0]
+    volt_thorlab = [0]
+    tec_thorlab.get_actual_temperature(temp_mC)
+    tec_thorlab.get_actual_current(curr_thorlab)
+    tec_thorlab.get_actual_voltage(volt_thorlab)
+    temp_thorlab = temp_mC[0] / 1000.0
+    return {
+        "temp": temp_thorlab,
+        "temp_thorlab": temp_thorlab,
+        "curr_thorlab": curr_thorlab[0] / 1000,
+        "volt_thorlab": volt_thorlab[0] / 1000,
+    }
+
+
+def per_meter_cal(
+    tec_thorlab,
+    per_meter_er100,
+    data_dir,
+    temp0=30,
+    temp1=36,
+    ramp_time_s=600,
+    ramp_step_s=1.0,
+    note="",
+):
+    """Ramp the Thorlabs TEC up and down while recording the ER-100.
+
+    The TEC is commanded to temp0 first. It then ramps from temp0 to temp1
+    over the first half of ramp_time_s and back to temp0 over the second half.
+    The setpoint is rewritten every ramp_step_s seconds. PER and the measured
+    Thorlabs temperature are recorded between those writes. et_0 is time since
+    the test started, and et_tecAdj is time since the ramp started.
+    """
+    if ramp_time_s <= 0:
+        raise ValueError("ramp_time_s must be positive")
+    if ramp_step_s <= 0 or ramp_step_s > ramp_time_s / 2:
+        raise ValueError("ramp_step_s must be positive and no more than ramp_time_s / 2")
+    columns = [
+        "time", "et_0", "et_tecAdj", "temp_tgt",
+        "temp", "temp_thorlab", "curr_thorlab", "volt_thorlab",
+        "per_dB", "theta", "pow",
+    ]
+    path = _new_csv_path(data_dir, "per meter cal")
+    writer = _RunWriter(path, columns, {"note": note})
+    print(f"Writing {path}")
+    t0 = time.time()
+    started = False
+    try:
+        per_meter_er100.stop(flush=True)
+        per_meter_er100.set_mode("er")
+        per_meter_er100.set_capture(True)
+        _set_thorlab_temperature(tec_thorlab, temp0)
+        per_meter_er100.start()
+        started = True
+        ramp_mark = time.monotonic()
+        t_tec = time.time()
+        next_write = ramp_mark
+        commanded = float(temp0)
+        while True:
+            elapsed = time.monotonic() - ramp_mark
+            if elapsed >= ramp_time_s:
+                break
+            if time.monotonic() >= next_write:
+                commanded = triangle_setpoint(elapsed, ramp_time_s, temp0, temp1)
+                _set_thorlab_temperature(tec_thorlab, commanded)
+                next_write = time.monotonic() + ramp_step_s
+            remain = ramp_time_s - (time.monotonic() - ramp_mark)
+            slice_s = min(next_write - time.monotonic(), remain)
+            if slice_s <= 0:
+                continue
+            for reading in per_meter_er100.iter_er(slice_s):
+                now = time.time()
+                tec_state = _read_thorlab_state(tec_thorlab)
+                row = {
+                    "time": _now(),
+                    "et_0": round(now - t0, 1),
+                    "et_tecAdj": round(now - t_tec, 1),
+                    "temp_tgt": commanded,
+                    "per_dB": reading.per_db,
+                    "theta": reading.angle_deg,
+                    "pow": reading.power_db,
+                }
+                row.update(tec_state)
+                writer.append([row])
+                print(
+                    row["et_0"],
+                    round(commanded, 3),
+                    round(tec_state["temp_thorlab"], 3),
+                    reading.per_db,
+                )
+        _set_thorlab_temperature(tec_thorlab, temp0)
+    except KeyboardInterrupt:
+        print(f"Interrupted. Partial data: {path}")
+    except Exception:
+        print(f"Partial data: {path}")
+        raise
+    finally:
+        if started:
+            per_meter_er100.stop(flush=True)
+    frame = _load_saved(path)
+    if len(frame) and "et_0" in frame.columns:
+        frame["et_s"] = frame["et_0"]
+        frame["et_min"] = frame["et_0"] / 60
+    return frame
+
+
 def per_vs_frequency_offset(
     tile,
     tec_thorlab,
@@ -940,3 +1346,1074 @@ def per_passive(per_meter, tec_thorlab, tec_arroyo, data_dir, period_s=10, note=
 
 def _dot(value):
     return str(value).replace(".", "p")
+
+
+def _grid_wavelength_nm(bank, channel):
+    """Return the Kurtz grid wavelength for one bank and channel."""
+    if bank == "A":
+        index = 2 * channel
+    elif bank == "B":
+        index = 2 * channel + 1
+    else:
+        raise ValueError(f"bank must be 'A' or 'B', got {bank!r}")
+    if channel < 0 or channel >= LANES_PER_BANK:
+        raise ValueError(f"channel must be 0..{LANES_PER_BANK - 1}, got {channel}")
+    return float(WAVELENGTH_GRID_NM[index])
+
+
+def _uw_to_dbm(power_uw):
+    """Convert microwatts to dBm. 0 dBm is 1 mW, which is 1000 uW."""
+    power_uw = np.asarray(power_uw, dtype=float)
+    if np.any(power_uw <= 0):
+        raise ValueError(f"CLM power must be positive uW to convert to dBm: {power_uw}")
+    return 10.0 * np.log10(power_uw / 1000.0)
+
+
+def _strongest_peaks(wavelength_nm, power_dbm, count=16):
+    """Return the count strongest peaks from scipy, sorted by wavelength."""
+    from scipy.signal import find_peaks
+
+    wavelength_nm = np.asarray(wavelength_nm, dtype=float)
+    power_dbm = np.asarray(power_dbm, dtype=float)
+    maxima, _ = find_peaks(power_dbm)
+    print(f"OSA trace peaks: {len(maxima)}")
+    if len(maxima) < count:
+        raise ValueError(f"Expected at least {count} OSA peaks, found {len(maxima)}")
+    strongest = maxima[np.argsort(power_dbm[maxima])[-count:]]
+    order = np.argsort(wavelength_nm[strongest])
+    chosen = strongest[order]
+    return wavelength_nm[chosen], power_dbm[chosen]
+
+
+def load_clm_to_OSA_OPM_loss(cfg):
+    """Return fitted 2x2 coupler path losses for OSA and OPM ports."""
+    result = {
+        "clm_osa_loss_A": c3db_loss(WAVELENGTH_GRID_NM_A)[cfg["two-by-two-coupler"]["A-OSA"]],
+        "clm_osa_loss_B": c3db_loss(WAVELENGTH_GRID_NM_B)[cfg["two-by-two-coupler"]["B-OSA"]],
+        "clm_opm_loss_A": c3db_loss(WAVELENGTH_GRID_NM_A)[cfg["two-by-two-coupler"]["A-OPM"]],
+        "clm_opm_loss_B": c3db_loss(WAVELENGTH_GRID_NM_B)[cfg["two-by-two-coupler"]["B-OPM"]],
+    }
+    return result
+
+
+def _dbm_to_mw(power_dbm):
+    return 10.0 ** (np.asarray(power_dbm, dtype=float) / 10.0)
+
+
+def prepare_tile_mission(tb, tile, cfg, tile_index=None, settle_s=30, log=print):
+    """Initialize one tile into Mission with all lanes on, then settle.
+
+    Reopens the package MCI before traffic. Skips CMIS SoftwareReset when it
+    returns Aardvark -103 (common right after a hardware reset).
+    Returns the (possibly refreshed) tile.
+    """
+    if tb is None:
+        raise ValueError("testboard handle tb is required")
+    if settle_s < 0:
+        raise ValueError("settle_s must be zero or positive")
+    if tile_index is None:
+        tile_index = cfg.get("tile_index")
+    label = f"tile {tile_index}" if tile_index is not None else "tile"
+
+    log(f"Preparing {label} for optical test...")
+    tile = ensure_tile_ready(tb, tile_index, log=log)
+
+    try:
+        mca.initialize_tile(tb, tile=tile, software_reset=True)
+    except Exception as first_exc:
+        log(
+            f"WARNING: initialize_tile(software_reset=True) failed on {label}: {first_exc}\n"
+            "Continuing with initialize_tile(software_reset=False) after package reopen..."
+        )
+        reopen_package_tiles(tb, log=log)
+        tile = tb.module.packages[0].tiles[int(tile_index)]
+        mca.initialize_tile(tb, tile=tile, software_reset=False)
+
+    apply_control_config(tile, **cfg["control"])
+    time.sleep(0.2)
+    mca.optical_power_on(tile)
+    log(f"Enabling all {N_LANES} channels on {label} (fire-up)...")
+    mca.clm_lane_enable(tile, chEnableMask=[1] * N_LANES)
+    log(
+        f"{label} fire-up complete; waiting {settle_s}s settle "
+        "before measurements..."
+    )
+    time.sleep(settle_s)
+    return tile
+
+
+def _power_tag_mW(power_tgt_mw) -> str:
+    """Format target power for config filenames: 8 -> 8mW, 6.4 -> 6p4mW."""
+    value = float(power_tgt_mw)
+    if value == int(value):
+        return f"{int(value)}mW"
+    text = f"{value:g}".replace(".", "p")
+    return f"{text}mW"
+
+
+def _sanitize_name(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(text).strip())
+    return cleaned or "unknown"
+
+
+def read_live_laser_voa_pic_temp(tile):
+    """Read live 16-ch laser bias, 16-ch VOA bias, and PIC temperature."""
+    laser_a = list(tile.read_bias_current_monitors(tile.Bank.BANK_A))
+    laser_b = list(tile.read_bias_current_monitors(tile.Bank.BANK_B))
+    voa_a = list(tile.read_aux_bias_current_monitors(tile.Bank.BANK_A))
+    voa_b = list(tile.read_aux_bias_current_monitors(tile.Bank.BANK_B))
+    laser = [float(x) for x in laser_a + laser_b]
+    voa = [float(x) for x in voa_a + voa_b]
+    if len(laser) != 16:
+        raise ValueError(f"Expected 16 laser bias monitors, got {len(laser)}")
+    if len(voa) != 16:
+        raise ValueError(f"Expected 16 VOA bias monitors, got {len(voa)}")
+    temp_pic = float(tile.read_temp_pic())
+    return {"laser": laser, "voa": voa, "temp_pic": temp_pic}
+
+
+def export_clm_config_yaml(
+    tile,
+    output_dir,
+    *,
+    tile_index,
+    dut_sn,
+    operator="",
+    power_tgt_mw=None,
+    laser_currents=None,
+    voa_currents=None,
+    temp_pic=None,
+):
+    """Write compact CLM config YAML (current / responsivity / temp) after tap cal.
+
+    Filename:
+    ``{tile_index}_0_tile_{dut_sn}_{tile_fru_sn}_config_file_{powerTag}.yaml``
+
+    Optional ``laser_currents`` / ``voa_currents`` / ``temp_pic`` override FRU
+    values (used after tap cal when live monitors are written to FRU).
+    ``operator`` is accepted for call-site compatibility but is not used in the
+    filename.
+    """
+    if power_tgt_mw is None:
+        power_tgt_mw = float(
+            load_test_spec().get("clm_test_spec", {}).get("target_power", 8)
+        )
+    fru = mca.get_fru_full(tile)
+    laser = (
+        [float(x) for x in laser_currents]
+        if laser_currents is not None
+        else [float(x) for x in fru["bias_currents"]]
+    )
+    voa = (
+        [float(x) for x in voa_currents]
+        if voa_currents is not None
+        else [float(x) for x in fru["voa_currents"]]
+    )
+    pic_t = float(temp_pic) if temp_pic is not None else float(fru["temp_pic"])
+    payload = {
+        "current": {
+            "laser": laser,
+            "voa": voa,
+        },
+        "responsivity": {
+            "mux": [float(x) for x in fru["mux_mpd_tap_ratios"]],
+            "pic": [float(x) for x in fru["pic_mpd_tap_ratios"]],
+        },
+        "temp": {
+            "mux": float(fru["temp_mux"]),
+            "pic": pic_t,
+        },
+    }
+    tile_fru_sn = _sanitize_name(fru.get("serial_number", "unknown"))
+    filename = (
+        f"{int(tile_index)}_0_tile_{_sanitize_name(dut_sn)}_{tile_fru_sn}_"
+        f"config_file_{_power_tag_mW(power_tgt_mw)}.yaml"
+    )
+    path = Path(output_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.dump(payload, handle, default_flow_style=False, sort_keys=False)
+    print(f"Wrote CLM config YAML: {path}")
+    return path
+
+
+def _tap_cal_sample(tile, osa, loss_A, loss_B, trace="TRA"):
+    """One CLM+OSA pass; PIC and MUX (aux) powers vs OSA-referred power."""
+    clm_power_A = np.asarray(
+        tile.read_optical_power_monitors(tile.Bank.BANK_A), dtype=float
+    )
+    clm_power_B = np.asarray(
+        tile.read_optical_power_monitors(tile.Bank.BANK_B), dtype=float
+    )
+    aux_power_A = np.asarray(
+        tile.read_aux_optical_power_monitors(tile.Bank.BANK_A), dtype=float
+    )
+    aux_power_B = np.asarray(
+        tile.read_aux_optical_power_monitors(tile.Bank.BANK_B), dtype=float
+    )
+    if len(clm_power_A) != 8 or len(clm_power_B) != 8:
+        raise ValueError(
+            f"Expected 8 CLM powers per bank, got A={len(clm_power_A)} B={len(clm_power_B)}"
+        )
+    if len(aux_power_A) != 8 or len(aux_power_B) != 8:
+        raise ValueError(
+            f"Expected 8 aux (MUX) powers per bank, got A={len(aux_power_A)} B={len(aux_power_B)}"
+        )
+    osa.write(f":TRAC:ACTIVE {trace}")
+    osa.sweep_done = False
+    osa.single_sweep()
+    wavelength_nm, power_dbm = osa.get_data()
+    peak_wavelength, peak_power = _strongest_peaks(wavelength_nm, power_dbm, count=16)
+    osa_peak_A = peak_power[0:16:2]
+    osa_peak_B = peak_power[1:16:2]
+    measured_dbm_A = osa_peak_A + loss_A
+    measured_dbm_B = osa_peak_B + loss_B
+    measured_mw = np.concatenate([_dbm_to_mw(measured_dbm_A), _dbm_to_mw(measured_dbm_B)])
+    clm_mw = np.concatenate([clm_power_A, clm_power_B]) / 1000.0
+    aux_mw = np.concatenate([aux_power_A, aux_power_B]) / 1000.0
+    if np.any(clm_mw <= 0) or np.any(aux_mw <= 0) or np.any(measured_mw <= 0):
+        raise ValueError(
+            "PIC, MUX (aux), and measured powers must be positive for tap correction"
+        )
+    corr_pic = measured_mw / clm_mw
+    corr_mux = measured_mw / aux_mw
+    return {
+        "clm_power_A": clm_power_A,
+        "clm_power_B": clm_power_B,
+        "aux_power_A": aux_power_A,
+        "aux_power_B": aux_power_B,
+        "clm_dbm_A": _uw_to_dbm(clm_power_A),
+        "clm_dbm_B": _uw_to_dbm(clm_power_B),
+        "aux_dbm_A": _uw_to_dbm(aux_power_A),
+        "aux_dbm_B": _uw_to_dbm(aux_power_B),
+        "osa_peak_A": osa_peak_A,
+        "osa_peak_B": osa_peak_B,
+        "peak_wavelength": peak_wavelength,
+        "measured_dbm_A": measured_dbm_A,
+        "measured_dbm_B": measured_dbm_B,
+        "clm_mw": clm_mw,
+        "aux_mw": aux_mw,
+        "corr_pic": corr_pic,
+        "corr_mux": corr_mux,
+    }
+
+
+def clm_tap_ratio_cal_osa(
+    tile,
+    osa,
+    cfg,
+    settle_s=60,
+    trace="TRA",
+    write_fru=True,
+    note="",
+    tile_index=None,
+    tb=None,
+    log=print,
+    n_samples=3,
+    data_dir=None,
+    dut_sn="",
+    operator="",
+):
+    """Recalibrate PIC and MUX MPD tap ratios using OSA + coupler path loss.
+
+    Takes n_samples passes of PIC (optical) and MUX (aux) monitors vs OSA peaks,
+    uses per-channel median corrections, optionally writes both tap arrays to
+    FRU. After taps, samples live laser/VOA/PIC temp, writes those to FRU
+    setpoints/app settings, and exports a compact config YAML.
+    """
+    if tile is None:
+        raise ValueError("tile handle is required")
+    if osa is None:
+        raise ValueError("osa handle is required")
+    if settle_s < 0:
+        raise ValueError("settle_s must be zero or positive")
+    if n_samples < 1:
+        raise ValueError("n_samples must be at least 1")
+    if tile_index is None:
+        tile_index = cfg.get("tile_index")
+    if data_dir is None:
+        data_dir = cfg.get("data_dir")
+
+    losses = load_clm_to_OSA_OPM_loss(cfg)
+    loss_A = np.asarray(losses["clm_osa_loss_A"], dtype=float)
+    loss_B = np.asarray(losses["clm_osa_loss_B"], dtype=float)
+    rows = []
+
+    label = f"tile {tile_index}" if tile_index is not None else "tile"
+    log(f"Tap ratio OSA cal {label}" + (f" ({note})" if note else ""))
+    tile = prepare_tile_mission(
+        tb, tile, cfg, tile_index=tile_index, settle_s=settle_s, log=log
+    )
+
+    samples = []
+    for pass_i in range(n_samples):
+        sample = _tap_cal_sample(tile, osa, loss_A, loss_B, trace=trace)
+        samples.append(sample)
+        log(
+            f"{label} tap-cal pass {pass_i + 1}/{n_samples} "
+            f"corr_pic={np.array2string(sample['corr_pic'], precision=4)} "
+            f"corr_mux={np.array2string(sample['corr_mux'], precision=4)}"
+        )
+        log(
+            f"PIC power {label} bank A (uW): "
+            f"{np.array2string(sample['clm_power_A'], precision=3)}"
+        )
+        log(
+            f"PIC power {label} bank B (uW): "
+            f"{np.array2string(sample['clm_power_B'], precision=3)}"
+        )
+        log(
+            f"MUX aux power {label} bank A (uW): "
+            f"{np.array2string(sample['aux_power_A'], precision=3)}"
+        )
+        log(
+            f"MUX aux power {label} bank B (uW): "
+            f"{np.array2string(sample['aux_power_B'], precision=3)}"
+        )
+
+    corr_pic = np.median(np.vstack([s["corr_pic"] for s in samples]), axis=0)
+    corr_mux = np.median(np.vstack([s["corr_mux"] for s in samples]), axis=0)
+    clm_mw = np.median(np.vstack([s["clm_mw"] for s in samples]), axis=0)
+    aux_mw = np.median(np.vstack([s["aux_mw"] for s in samples]), axis=0)
+    clm_dbm_A = np.median(np.vstack([s["clm_dbm_A"] for s in samples]), axis=0)
+    clm_dbm_B = np.median(np.vstack([s["clm_dbm_B"] for s in samples]), axis=0)
+    aux_dbm_A = np.median(np.vstack([s["aux_dbm_A"] for s in samples]), axis=0)
+    aux_dbm_B = np.median(np.vstack([s["aux_dbm_B"] for s in samples]), axis=0)
+    osa_peak_A = np.median(np.vstack([s["osa_peak_A"] for s in samples]), axis=0)
+    osa_peak_B = np.median(np.vstack([s["osa_peak_B"] for s in samples]), axis=0)
+    measured_dbm_A = np.median(np.vstack([s["measured_dbm_A"] for s in samples]), axis=0)
+    measured_dbm_B = np.median(np.vstack([s["measured_dbm_B"] for s in samples]), axis=0)
+    peak_wavelength = np.median(
+        np.vstack([s["peak_wavelength"] for s in samples]), axis=0
+    )
+
+    fru = mca.get_fru_full(tile)
+    pic_old = list(fru["pic_mpd_tap_ratios"])
+    mux_old = list(fru["mux_mpd_tap_ratios"])
+    if len(pic_old) != 16:
+        raise ValueError(f"Expected 16 PIC tap ratios, got {len(pic_old)}")
+    if len(mux_old) != 16:
+        raise ValueError(f"Expected 16 MUX tap ratios, got {len(mux_old)}")
+    pic_new = [round(float(pic_old[ch] / corr_pic[ch]), 4) for ch in range(16)]
+    mux_new = [round(float(mux_old[ch] / corr_mux[ch]), 4) for ch in range(16)]
+
+    log(f"old pic tap ratios: {pic_old}")
+    log(f"new pic tap ratios: {pic_new}")
+    log(f"old mux tap ratios: {mux_old}")
+    log(f"new mux tap ratios: {mux_new}")
+    log(f"median PIC corr (measured/pic): {np.array2string(corr_pic, precision=4)}")
+    log(f"median MUX corr (measured/aux): {np.array2string(corr_mux, precision=4)}")
+
+    live = None
+    if write_fru:
+        tile.flash_write_fru_optical_measurements(
+            pic_new, mux_new, fru["mux_freq_errors"]
+        )
+        log(f"Wrote PIC and MUX tap ratios to FRU for {label}")
+
+        live = read_live_laser_voa_pic_temp(tile)
+        log(
+            f"Live laser bias (mA): "
+            f"{np.array2string(np.asarray(live['laser']), precision=3)}"
+        )
+        log(
+            f"Live VOA bias (mA): "
+            f"{np.array2string(np.asarray(live['voa']), precision=3)}"
+        )
+        log(f"Live PIC temp (C): {live['temp_pic']:.3f}")
+
+        # VOA lives in app settings; keep existing power / freq targets.
+        tile.flash_write_fru_app_settings(
+            voa_currents=live["voa"],
+            power_targets=list(fru["power_targets"]),
+            freq_error_targets=list(fru["freq_error_targets"]),
+        )
+        # Laser + PIC temp in setpoints; keep MUX temp, MPD currents, and gains.
+        tile.flash_write_fru_setpoints(
+            live["temp_pic"],
+            float(fru["temp_mux"]),
+            live["laser"],
+            list(fru.get("pic_mpd_currents") or [0] * 16),
+            list(fru.get("mux_mpd_currents") or [0] * 16),
+            list(fru.get("mux_mpd_gain_settings") or [0] * 16),
+        )
+        log(
+            f"Wrote live laser/VOA bias and PIC temp to FRU for {label} "
+            f"(MUX temp left at {float(fru['temp_mux']):.3f} C)"
+        )
+
+    if data_dir:
+        try:
+            yaml_kwargs = {}
+            if live is not None:
+                yaml_kwargs = {
+                    "laser_currents": live["laser"],
+                    "voa_currents": live["voa"],
+                    "temp_pic": live["temp_pic"],
+                }
+            yaml_path = export_clm_config_yaml(
+                tile,
+                data_dir,
+                tile_index=tile_index if tile_index is not None else 0,
+                dut_sn=dut_sn or "unknown",
+                operator=operator or "",
+                **yaml_kwargs,
+            )
+            log(f"CLM config YAML: {yaml_path}")
+        except Exception as exc:
+            log(f"WARNING: failed to write CLM config YAML: {exc}")
+
+    for ch in range(16):
+        bank = "A" if ch < 8 else "B"
+        lane = ch if ch < 8 else ch - 8
+        rows.append({
+            "tile": tile_index,
+            "bank": bank,
+            "ch": lane,
+            "clm_power_uW": float(clm_mw[ch] * 1000.0),
+            "clm_power_dBm": float(
+                clm_dbm_A[lane] if bank == "A" else clm_dbm_B[lane]
+            ),
+            "aux_power_uW": float(aux_mw[ch] * 1000.0),
+            "aux_power_dBm": float(
+                aux_dbm_A[lane] if bank == "A" else aux_dbm_B[lane]
+            ),
+            "osa_peak_power_dBm": float(
+                osa_peak_A[lane] if bank == "A" else osa_peak_B[lane]
+            ),
+            "osa_peak_wavelength_nm": float(
+                peak_wavelength[0:16:2][lane]
+                if bank == "A"
+                else peak_wavelength[1:16:2][lane]
+            ),
+            "clm_osa_loss_dB": float(loss_A[lane] if bank == "A" else loss_B[lane]),
+            "power_from_osa_dBm": float(
+                measured_dbm_A[lane] if bank == "A" else measured_dbm_B[lane]
+            ),
+            "corr_pic": float(corr_pic[ch]),
+            "corr_mux": float(corr_mux[ch]),
+            "pic_mpd_tap_ratio_old": float(pic_old[ch]),
+            "pic_mpd_tap_ratio_new": float(pic_new[ch]),
+            "mux_mpd_tap_ratio_old": float(mux_old[ch]),
+            "mux_mpd_tap_ratio_new": float(mux_new[ch]),
+            "note": note,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def clm_to_OSA_loss_cal(tile, osa, trace="TRA"):
+    """Compare CLM monitor power with OSA peaks and return the path loss.
+
+    Each bank's optical power monitor is 8 values in uW. The OSA trace is
+    swept and the 16 strongest peaks are sorted by wavelength. Even peaks
+    are bank A and odd peaks are bank B, matching the interleaved frequency
+    grid. Loss is CLM power in dBm minus the OSA peak power in dBm.
+    """
+    clm_power_A = np.asarray(
+        tile.read_optical_power_monitors(tile.Bank.BANK_A), dtype=float
+    )
+    clm_power_B = np.asarray(
+        tile.read_optical_power_monitors(tile.Bank.BANK_B), dtype=float
+    )
+    if len(clm_power_A) != 8 or len(clm_power_B) != 8:
+        raise ValueError(
+            f"Expected 8 CLM powers per bank, got A={len(clm_power_A)} B={len(clm_power_B)}"
+        )
+
+    osa.write(f":TRAC:ACTIVE {trace}")
+    osa.sweep_done = False
+    osa.single_sweep()
+    wavelength_nm, power_dbm = osa.get_data()
+    peak_wavelength, peak_power = _strongest_peaks(wavelength_nm, power_dbm, count=16)
+
+    osa_peak_wavelength_A = peak_wavelength[0:16:2]
+    osa_peak_wavelength_B = peak_wavelength[1:16:2]
+    osa_peak_power_A = peak_power[0:16:2]
+    osa_peak_power_B = peak_power[1:16:2]
+    result = {
+        "clm_power_A": clm_power_A,
+        "clm_power_B": clm_power_B,
+        "osa_peak_power_A": osa_peak_power_A,
+        "osa_peak_power_B": osa_peak_power_B,
+        "clm_osa_loss_A": _uw_to_dbm(clm_power_A) - osa_peak_power_A,
+        "clm_osa_loss_B": _uw_to_dbm(clm_power_B) - osa_peak_power_B,
+        "osa_peak_wavelength_A": osa_peak_wavelength_A,
+        "osa_peak_wavelength_B": osa_peak_wavelength_B,
+    }
+    for name, values in result.items():
+        print(name, np.array2string(values, precision=3))
+    return result
+
+def clm_power_n_wavelength_stability(
+    tile,
+    osa,
+    clm_osa_loss_A,
+    clm_osa_loss_B,
+    test_duration=60 * 15,
+    sample_interval=10,
+    trace="TRA",
+    idx_tile=3,
+):
+    """Record CLM power and OSA wavelength until test_duration seconds have passed.
+
+    Each sample calls clm_to_OSA_loss_cal for the live CLM powers and OSA
+    peaks. The loss arrays returned by that call are not used. clm_osa_loss_A
+    and clm_osa_loss_B are the calibration losses supplied by the caller.
+    OSA peak power plus that loss is the OSA power referred back to the CLM.
+    idx_tile is written on every row. wavelength_error_nm is the OSA peak
+    minus the Kurtz grid wavelength for that bank and channel.
+    """
+    loss_A = np.asarray(clm_osa_loss_A, dtype=float)
+    loss_B = np.asarray(clm_osa_loss_B, dtype=float)
+    if len(loss_A) != 8 or len(loss_B) != 8:
+        raise ValueError(
+            f"Expected 8 loss values per bank, got A={len(loss_A)} B={len(loss_B)}"
+        )
+    if test_duration <= 0:
+        raise ValueError("test_duration must be positive")
+    if sample_interval <= 0:
+        raise ValueError("sample_interval must be positive")
+
+    columns = [
+        "time", "et_s", "idx_tile", "bank", "ch",
+        "clm_power_uW", "clm_power_dBm",
+        "osa_peak_power_dBm", "osa_peak_wavelength_nm", "wavelength_error_nm",
+        "clm_osa_loss_dB", "power_from_osa_dBm",
+    ]
+    frames = []
+    t0 = time.monotonic()
+    deadline = t0 + test_duration
+    next_sample = t0
+    try:
+        while time.monotonic() < deadline:
+            wait_s = next_sample - time.monotonic()
+            if wait_s > 0:
+                time.sleep(min(wait_s, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                break
+            sample = clm_to_OSA_loss_cal(tile, osa, trace=trace)
+            et_s = round(time.monotonic() - t0, 1)
+            stamp = _now()
+            rows = []
+            banks = (
+                ("A", sample["clm_power_A"], sample["osa_peak_power_A"],
+                 sample["osa_peak_wavelength_A"], loss_A),
+                ("B", sample["clm_power_B"], sample["osa_peak_power_B"],
+                 sample["osa_peak_wavelength_B"], loss_B),
+            )
+            for bank, clm_uw, osa_dbm, wavelength_nm, loss_db in banks:
+                clm_dbm = _uw_to_dbm(clm_uw)
+                for channel in range(8):
+                    rows.append({
+                        "time": stamp,
+                        "et_s": et_s,
+                        "idx_tile": idx_tile,
+                        "bank": bank,
+                        "ch": channel,
+                        "clm_power_uW": clm_uw[channel],
+                        "clm_power_dBm": clm_dbm[channel],
+                        "osa_peak_power_dBm": osa_dbm[channel],
+                        "osa_peak_wavelength_nm": wavelength_nm[channel],
+                        "wavelength_error_nm": (
+                            wavelength_nm[channel] - _grid_wavelength_nm(bank, channel)
+                        ),
+                        "clm_osa_loss_dB": loss_db[channel],
+                        "power_from_osa_dBm": osa_dbm[channel] + loss_db[channel],
+                    })
+            frames.append(pd.DataFrame(rows, columns=columns))
+            print(f"sample et_s={et_s}")
+            next_sample += sample_interval
+    except KeyboardInterrupt:
+        print("Interrupted. Returning samples collected so far.")
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)
+
+
+def summarize_clm_stability(df, power_tgt_mw=8):
+    """Reduce a stability dataframe to one row per tile, bank, and channel.
+
+    wavelength error is the mean of wavelength_error_nm.
+    power error is the mean of power_from_osa_dBm minus 10*log10(power_tgt_mw).
+    15 min power stability is 3 times the sample standard deviation of that
+    same power error. Fewer than two samples leaves the stability value empty.
+    """
+    metrics = ["wavelength error", "power error", "15 min power stability"]
+    columns = ["tile", "bank", "channel", *metrics]
+    if power_tgt_mw <= 0:
+        raise ValueError("power_tgt_mw must be positive")
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=columns)
+
+    target_dbm = 10.0 * np.log10(float(power_tgt_mw))
+    work = df.copy()
+    work["power_error_dB"] = work["power_from_osa_dBm"] - target_dbm
+    rows = []
+    grouped = work.groupby(["idx_tile", "bank", "ch"], sort=True)
+    for (idx_tile, bank, channel), group in grouped:
+        power_error = group["power_error_dB"]
+        deviation = power_error.std(ddof=1)
+        rows.append({
+            "tile": int(idx_tile),
+            "bank": bank,
+            "channel": int(channel),
+            "wavelength error": float(group["wavelength_error_nm"].mean()),
+            "power error": float(power_error.mean()),
+            "15 min power stability": (
+                None if pd.isna(deviation) else float(3.0 * deviation)
+            ),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def clm_power_and_frequency_test(
+    tile,
+    osa,
+    cfg,
+    *,
+    tb=None,
+    tile_index=None,
+    test_duration=60 * 15,
+    sample_interval=10,
+    settle_s=30,
+    prepare_tile=True,
+    data_dir=None,
+    power_tgt_mw=None,
+    note="",
+    log=print,
+):
+    """Run power and wavelength stability on one tile and summarize results.
+
+    Optionally initializes the tile, enables all channels, and waits settle_s
+    after fire-up. Coupler OSA path losses come from load_clm_to_OSA_OPM_loss.
+    Returns ``(raw_df, summary_df)`` where summary matches summarize_clm_stability.
+    """
+    if tile is None:
+        raise ValueError("tile handle is required")
+    if osa is None:
+        raise ValueError("osa handle is required")
+    if tile_index is None:
+        tile_index = cfg.get("tile_index", 3)
+    if data_dir is None:
+        data_dir = cfg.get("data_dir")
+    if power_tgt_mw is None:
+        spec = load_test_spec()
+        power_tgt_mw = float(spec.get("clm_test_spec", {}).get("target_power", 8))
+
+    label = f"tile {tile_index}"
+    log(f"Power and frequency test {label}" + (f" ({note})" if note else ""))
+
+    if prepare_tile:
+        tile = prepare_tile_mission(
+            tb, tile, cfg, tile_index=tile_index, settle_s=settle_s, log=log
+        )
+
+    losses = load_clm_to_OSA_OPM_loss(cfg)
+    raw_df = clm_power_n_wavelength_stability(
+        tile,
+        osa,
+        losses["clm_osa_loss_A"],
+        losses["clm_osa_loss_B"],
+        test_duration=test_duration,
+        sample_interval=sample_interval,
+        trace="TRA",
+        idx_tile=int(tile_index),
+    )
+    if data_dir and len(raw_df):
+        save_run(
+            raw_df,
+            data_dir,
+            f"clm_power_n_wavelength_stability_tile{tile_index}",
+            params={"note": note, "tile_index": tile_index},
+        )
+
+    summary = summarize_clm_stability(raw_df, power_tgt_mw=power_tgt_mw)
+    print(f"Power and frequency summary {label}:\n{summary}")
+    return raw_df, summary
+
+
+def _lanes_off(tile):
+    """Disable every lane. This is the optical-off step between fiber moves."""
+    mca.clm_lane_enable(tile, chEnableMask=[0] * N_LANES)
+
+
+def _ask_fiber_connected(port_name):
+    """Ask the operator to connect one CLM port. True means Yes."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return bool(messagebox.askyesno(
+            "CLM PER test",
+            f"Connect CLM port {port_name} to the PER meter.\n"
+            "Click Yes when the fiber is connected.",
+            parent=root,
+        ))
+    finally:
+        root.destroy()
+
+
+def clm_per_test(
+    tile,
+    tec_thorlab,
+    tec_arroyo,
+    per_meter,
+    data_dir,
+    channels=range(LANES_PER_BANK),
+    temp0=30,
+    temp1=36,
+    channel_s=600,
+    channel_settle_s=20,
+    ramp_step_s=1.0,
+    tile_index=None,
+    note="",
+):
+    """Measure PER on port A, then port B, and save the combined frame.
+
+    All lanes are disabled before each prompt and again at the end. No on a
+    prompt skips that port. Each port still writes the per_over_temp_3 CSV.
+    The combined CSV is clm per test_<timestamp>.csv.
+    """
+    channels = list(channels)
+    frames = []
+    try:
+        for bank, port_name in ((0, "A"), (1, "B")):
+            _lanes_off(tile)
+            if not _ask_fiber_connected(port_name):
+                print(f"Port {port_name} skipped.")
+                continue
+            frame = per_over_temp_3(
+                tile,
+                tec_thorlab,
+                tec_arroyo,
+                per_meter,
+                data_dir,
+                bank=bank,
+                channels=channels,
+                temp0=temp0,
+                temp1=temp1,
+                channel_s=channel_s,
+                channel_settle_s=channel_settle_s,
+                ramp_step_s=ramp_step_s,
+                tile_index=tile_index,
+                note=note,
+            )
+            if frame is not None and len(frame):
+                frames.append(frame)
+    finally:
+        _lanes_off(tile)
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if len(combined):
+        save_run(combined, data_dir, "clm per test", params={"note": note})
+    return combined
+
+
+def _ask_per_fibers_dual():
+    """Yes/No: connect A→ER-1000 and B→ER-100. False if No or dialog closed."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return bool(
+            messagebox.askyesno(
+                "PER fiber hookup",
+                "All CLM channels are off.\n\n"
+                "Connect CLM port A to per_meter (ER-1000) input.\n"
+                "Connect CLM port B to per_meter_er100 (ER-100) input.\n\n"
+                "Click Yes when both fibers are connected.",
+                parent=root,
+            )
+        )
+    finally:
+        root.destroy()
+
+
+def per_over_temp_3_dual_meter(
+    tile,
+    tec_arroyo,
+    per_meter,
+    per_meter_er100,
+    data_dir,
+    channels=range(LANES_PER_BANK),
+    temp0=25,
+    temp1=45,
+    channel_s=600,
+    channel_settle_s=20,
+    ramp_step_s=1.0,
+    tile_index=None,
+    note="",
+    log=print,
+):
+    """PER vs Arroyo triangle ramp with both meters at once.
+
+    For each channel index, enables bank-A and bank-B lanes together.
+    ``per_meter`` (ER-1000) records bank A; ``per_meter_er100`` records bank B.
+    Thorlabs TEC is not used.
+    """
+    channels = list(channels)
+    if channel_s <= 0:
+        raise ValueError("channel_s must be positive")
+    if channel_settle_s < 0:
+        raise ValueError("channel_settle_s must be zero or positive")
+    if ramp_step_s <= 0 or ramp_step_s > channel_s / 2:
+        raise ValueError("ramp_step_s must be positive and no more than channel_s / 2")
+    columns = [
+        "time", "et_0", "et_chEnb", "et_tecAdj", "temp_tgt",
+        "temp", "temp_thorlab", "temp_arroyo",
+        "curr_thorlab", "volt_thorlab", "curr_arroyo", "volt_arroyo",
+        "bank", "ch", "tile_index", "per_dB", "theta", "pow",
+    ]
+    path = _new_csv_path(data_dir, "per over temp 3 dual meter")
+    writer = _RunWriter(path, columns, {"note": note})
+    log(f"Writing {path}")
+    t0 = time.time()
+    started = False
+    try:
+        for meter in (per_meter, per_meter_er100):
+            meter.stop(flush=True)
+            meter.set_mode("er")
+            meter.set_capture(True)
+        set_temperature_arroyo(tec_arroyo, temp0)
+        for channel in tqdm(channels, desc="channel"):
+            # Bank A and bank B same channel index, both meters live.
+            mca.clm_lane_enable(
+                tile,
+                chEnableMask=lane_mask(
+                    [channel, LANES_PER_BANK + channel]
+                ),
+            )
+            t_ch = time.time()
+            settle_deadline = time.monotonic() + channel_settle_s
+            while time.monotonic() < settle_deadline:
+                time.sleep(min(0.5, settle_deadline - time.monotonic()))
+                if started:
+                    per_meter._discard_input()
+                    per_meter_er100._discard_input()
+            if not started:
+                per_meter.start()
+                per_meter_er100.start()
+                started = True
+            ramp_mark = time.monotonic()
+            t_tec = time.time()
+            next_write = ramp_mark
+            commanded = float(temp0)
+            while True:
+                elapsed = time.monotonic() - ramp_mark
+                if elapsed >= channel_s:
+                    break
+                if time.monotonic() >= next_write:
+                    commanded = triangle_setpoint(elapsed, channel_s, temp0, temp1)
+                    set_temperature_arroyo(tec_arroyo, commanded)
+                    next_write = time.monotonic() + ramp_step_s
+                remain = channel_s - (time.monotonic() - ramp_mark)
+                slice_s = min(next_write - time.monotonic(), remain)
+                if slice_s <= 0:
+                    continue
+                readings_a, readings_b = _collect_er_both(
+                    per_meter, per_meter_er100, slice_s
+                )
+                now = time.time()
+                tec_state = read_tec_state_arroyo(tec_arroyo)
+                rows = []
+                for bank, readings in ((0, readings_a), (1, readings_b)):
+                    for reading in readings:
+                        row = {
+                            "time": _now(),
+                            "et_0": round(now - t0, 1),
+                            "et_chEnb": round(now - t_ch, 1),
+                            "et_tecAdj": round(now - t_tec, 1),
+                            "temp_tgt": commanded,
+                            "ch": channel,
+                            "bank": bank,
+                            "tile_index": tile_index,
+                            "per_dB": reading.per_db,
+                            "theta": reading.angle_deg,
+                            "pow": _reading_power(reading),
+                        }
+                        row.update(tec_state)
+                        rows.append(row)
+                if rows:
+                    writer.append(rows)
+                    log(
+                        f"et={rows[0]['et_0']} ch={channel} "
+                        f"T={commanded:.2f} "
+                        f"A_samples={len(readings_a)} B_samples={len(readings_b)}"
+                    )
+            set_temperature_arroyo(tec_arroyo, temp0)
+            _lanes_off(tile)
+    except KeyboardInterrupt:
+        log(f"Interrupted. Partial data: {path}")
+    except Exception:
+        log(f"Partial data: {path}")
+        raise
+    finally:
+        if started:
+            try:
+                per_meter.stop(flush=True)
+            except Exception:
+                pass
+            try:
+                per_meter_er100.stop(flush=True)
+            except Exception:
+                pass
+        _lanes_off(tile)
+    frame = _load_saved(path)
+    if len(frame) and "et_0" in frame.columns:
+        frame["et_s"] = frame["et_0"]
+        frame["et_min"] = frame["et_0"] / 60
+    return frame
+
+
+def clm_per_test_dual_meter(
+    tile,
+    tec_arroyo,
+    per_meter,
+    per_meter_er100,
+    data_dir,
+    cfg=None,
+    tb=None,
+    channels=range(LANES_PER_BANK),
+    temp0=25,
+    temp1=45,
+    channel_s=600,
+    channel_settle_s=20,
+    ramp_step_s=1.0,
+    tile_index=None,
+    prepare_tile=True,
+    settle_s=30,
+    note="",
+    log=print,
+):
+    """Acceptance PER: Arroyo-only ramp, dual meters, one fiber-confirm popup.
+
+    Disables all channels, prompts for A→ER-1000 and B→ER-100, then runs
+    per_over_temp_3_dual_meter. Returns ``(raw_df, per_summary_df)``.
+    """
+    if tile is None:
+        raise ValueError("tile handle is required")
+    if tec_arroyo is None:
+        raise ValueError("tec_arroyo handle is required")
+    if per_meter is None or per_meter_er100 is None:
+        raise ValueError("both per_meter and per_meter_er100 are required")
+    if tile_index is None and cfg is not None:
+        tile_index = cfg.get("tile_index")
+
+    log(f"PER dual-meter test tile {tile_index}" + (f" ({note})" if note else ""))
+    if prepare_tile:
+        if cfg is None or tb is None:
+            raise ValueError("prepare_tile requires tb and cfg")
+        tile = prepare_tile_mission(
+            tb, tile, cfg, tile_index=tile_index, settle_s=settle_s, log=log
+        )
+
+    _lanes_off(tile)
+    if not _ask_per_fibers_dual():
+        log("PER fiber hookup cancelled (No or dialog closed). Skipping PER.")
+        empty = pd.DataFrame()
+        return empty, channel_min_per(empty)
+
+    raw = per_over_temp_3_dual_meter(
+        tile,
+        tec_arroyo,
+        per_meter,
+        per_meter_er100,
+        data_dir,
+        channels=channels,
+        temp0=temp0,
+        temp1=temp1,
+        channel_s=channel_s,
+        channel_settle_s=channel_settle_s,
+        ramp_step_s=ramp_step_s,
+        tile_index=tile_index,
+        note=note,
+        log=log,
+    )
+    if len(raw):
+        tile_tag = tile_index if tile_index is not None else "x"
+        csv_path = save_run(
+            raw,
+            data_dir,
+            f"clm_per_test_dual_meter_tile{tile_tag}",
+            params={"note": note, "tile_index": tile_index},
+        )
+        log(f"PER raw CSV: {csv_path}")
+        try:
+            import clm_plots as plots
+
+            for bank, bank_name in ((0, "A"), (1, "B")):
+                subset = raw[raw["bank"] == bank]
+                if subset.empty:
+                    continue
+                stem = f"per_tile{tile_tag}_bank{bank_name}"
+                result = plots.plot_per_vs_temperature(
+                    subset,
+                    output_dir=data_dir,
+                    file_stem=stem,
+                    show=False,
+                )
+                paths = result[1] if isinstance(result, tuple) else []
+                for path in paths:
+                    log(f"PER plot: {path}")
+        except Exception as exc:
+            log(f"WARNING: PER plot save failed: {exc}")
+    summary = channel_min_per(raw)
+    log(f"PER summary tile {tile_index}:\n{summary}")
+    return raw, summary
+
+
+def _report_bank(bank):
+    if bank in ("A", "B"):
+        return bank
+    return {0: "A", 1: "B"}[int(bank)]
+
+
+def _min_inlier_per(group, min_points=20):
+    """Minimum per_dB after IsolationForest drops outliers in (theta, per_dB)."""
+    from sklearn.ensemble import IsolationForest
+
+    clean = group.dropna(subset=["theta", "per_dB"])
+    if len(clean) == 0:
+        return None
+    if len(clean) < min_points:
+        return float(clean["per_dB"].min())
+    features = clean.loc[:, ["theta", "per_dB"]].to_numpy(dtype=float)
+    labels = IsolationForest(contamination="auto", random_state=0).fit_predict(features)
+    inliers = clean.iloc[labels == 1]["per_dB"]
+    if len(inliers) == 0:
+        inliers = clean["per_dB"]
+    return float(inliers.min())
+
+
+def channel_min_per(df, min_points=20):
+    """One report row per tile, bank, and channel.
+
+    min PER is the minimum inlier per_dB. Bank 0/1 is written as A/B.
+    """
+    columns = ["tile", "bank", "channel", "min PER"]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=columns)
+    work = df.copy()
+    if "tile_index" in work.columns:
+        work["tile"] = work["tile_index"]
+    elif "idx_tile" not in work.columns and "tile" not in work.columns:
+        work["tile"] = None
+    elif "idx_tile" in work.columns and "tile" not in work.columns:
+        work["tile"] = work["idx_tile"]
+    rows = []
+    grouped = work.groupby(["tile", "bank", "ch"], sort=True, dropna=False)
+    for (tile, bank, channel), group in grouped:
+        tile_value = None if pd.isna(tile) else int(tile)
+        rows.append({
+            "tile": tile_value,
+            "bank": _report_bank(bank),
+            "channel": int(channel),
+            "min PER": _min_inlier_per(group, min_points=min_points),
+        })
+    return pd.DataFrame(rows, columns=columns)
