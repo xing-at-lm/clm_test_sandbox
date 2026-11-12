@@ -108,9 +108,9 @@ df = clm_exp.power_range_sweep(
     tb,
     tile,
     DATA_DIR,
-    power_targets=[12, 9, 6, 3, 5, 8, 11, 14],
+    power_targets=[8, 14, 4, 1, 8],
     single_channel=0,
-    sample_s=300,
+    sample_s=180,
     interval_s=2,
     settle_s=60,
     dither_period_s=2,
@@ -124,6 +124,21 @@ df = clm_exp.power_range_sweep(
 
 # %% plot power range
 plots.plot_power_stability(df, p_ylim=None)
+
+#%% power level sweep, all 16 lanes
+# duration_s is the dwell at each power target. interval_s is the sample
+# period inside that dwell. tweakT_PIC is passed into get_clm_record.
+df = clm_exp.power_level_sweep(
+    tile,
+    DATA_DIR,
+    power_targets=[8, 12, 8,4,8],
+    duration_s=900,
+    interval_s=6,
+    tweakT_PIC=False,
+    tile_index=cfg["tile_index"],
+    note="",
+)
+plots.plot_power_level_sweep(df)
 
 # %% open Thorlabs TEC
 tec_thorlab = clm_exp.open_ptc(cfg)

@@ -4,6 +4,8 @@
 # ### Dependencies
 
 import time
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 #import seaborn as sns
@@ -214,8 +216,32 @@ def reinitialize_bootloader(tb,dir_fw,filename_fw,idxTiles=[3,4]):
 
 
 
+def target_power_mw_from_spec():
+    """Channel power setpoint from clm_test_spec.yaml, in mW.
+
+    Capped to the same 0.1–14.5 mW range as the old default setpoint.
+    """
+    path = Path(__file__).resolve().parent / "clm_test_spec.yaml"
+    with open(path, encoding="utf-8") as handle:
+        spec = yaml.safe_load(handle) or {}
+    section = spec.get("clm_test_spec") or {}
+    if "target_power" not in section:
+        raise ValueError(f"clm_test_spec.target_power is missing from {path}")
+    power = float(section["target_power"])
+    if power > CAP_MAX_POWER_SETTING_MW:
+        print(f"INFO: Capped target_power {power:g} mW to {CAP_MAX_POWER_SETTING_MW:g} mW")
+        power = CAP_MAX_POWER_SETTING_MW
+    elif power < CAP_MIN_POWER_SETTING_MW:
+        print(f"INFO: Capped target_power {power:g} mW to {CAP_MIN_POWER_SETTING_MW:g} mW")
+        power = CAP_MIN_POWER_SETTING_MW
+    return power
+
+
 def _configure_tile_low_power(tile_i, tile_idx="?"):
     """Fault masks, dither defaults, low-power, and power/freq setpoints (no software_reset)."""
+    global pwr_setpoint
+    pwr_setpoint = target_power_mw_from_spec()
+    print(f"Optical power setpoint {pwr_setpoint:g} mW from clm_test_spec.yaml")
     tile_i.write_mask_optical_fault_passive(1)
     tile_i.write_mask_optical_fault_active(1)
     tile_i.write_self_test_s(0)
@@ -309,7 +335,7 @@ def get_faults(tile):
     return {'fault': tile.read_fault().name,'custom_fault':tile.read_custom_fault().name}
     
 
-def get_clm_record(tiles, duration_s=30,interval_s=2):
+def get_clm_record(tiles, duration_s=30, interval_s=2, tweakT_PIC=False):
     cols=['time','et_s','tile','bank','T_PMIC','T_PIC','T_MUX']+\
          [f'I_LD{i}' for i in range(8)]+\
          [f'I_VOA{i}' for i in range(8)]+\
@@ -371,8 +397,8 @@ def get_clm_record(tiles, duration_s=30,interval_s=2):
     delta_t_bwt_read=0.1
     while et_s<=duration_s:
          for i, tile in enumerate(tiles):
-            I_VOA_min=[]
-            I_VOA_max=[]
+            i_ld = []
+            i_voa = []
             for b, bank in enumerate(ClmTile.Bank):
                 t=time.time()
                 et_s=t-t0
@@ -382,12 +408,34 @@ def get_clm_record(tiles, duration_s=30,interval_s=2):
                 rcd.append(i)
 
                 rcd.append(b)
-                rcd_bank=get_bank_record(tile,bank)    
+                rcd_bank=get_bank_record(tile,bank)
                 rcds.append(rcd+rcd_bank)
-                
-                I_VOA_min.append(np.array(rcd_bank[11:11+8]).min())
-                I_VOA_max.append(np.array(rcd_bank[11:11+8]).max())                
-                
+
+                i_ld.extend(rcd_bank[3:3+8])
+                i_voa.extend(rcd_bank[11:11+8])
+            if tweakT_PIC:
+                i_ld = np.asarray(i_ld, dtype=float)
+                i_voa = np.asarray(i_voa, dtype=float)
+                score = np.zeros(16)
+                for ch in range(16):
+                    if i_ld[ch] >= 184:
+                        score[ch] += 1
+                    if i_voa[ch] <= 0.1:
+                        score[ch] += -1
+                    if i_ld[ch] <= 80:
+                        score[ch] += -1
+                    if i_voa[ch] >= 19.9:
+                        score[ch] += 1
+                t_pic_step = 0.08 * np.sign(np.sum(np.unique(score)))
+                if t_pic_step != 0:
+                    t_pic = tile.read_pic_tec_setpoint() + t_pic_step
+                    t_pic = float(np.clip(t_pic, 30, 65))
+                    tile.write_pic_tec_setpoint(t_pic)
+                    print(
+                        f"\nT_PIC setpoint -> {t_pic:.2f} C "
+                        f"(score {np.sum(np.unique(score)):.0f})",
+                        flush=True,
+                    )
          time.sleep(interval_s)
          print(f'{et_s/duration_s*100:.2f}%,', end='', flush=True)
          #print(f'et_s, duration: ,{et_s:.1f},{duration_s}')

@@ -59,12 +59,14 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m {secs}s"
 
 
-# Map clm_test_spec.yaml keys -> report metric names.
-_SPEC_YAML_TO_REPORT = {
-    "wavelength_error": "wavelength error",
-    "power_error": "power error",
-    "power_stability": "15 min power stability",
-    "PER": "min PER",
+# Report metric -> clm_test_spec.yaml key. The 6 min dither-off section
+# uses the same power_stability window as the 15 min section.
+_REPORT_LIMIT_SOURCE = {
+    "wavelength error": "wavelength_error",
+    "power error": "power_error",
+    "15 min power stability": "power_stability",
+    clm_exp.MUX_DITHER_OFF_STABILITY: "power_stability",
+    "min PER": "PER",
 }
 
 # ---------------------------------------------------------------------------
@@ -180,6 +182,7 @@ def run_power_and_frequency(session: "StationSession", meta: "DutMeta") -> None:
             settle_s=30,
             prepare_tile=prepare_tile,
             data_dir=session.output_dir(),
+            serial_number=meta.serial_number,
             note=f"{note} tile={idx}",
             log=session.log,
         )
@@ -189,8 +192,75 @@ def run_power_and_frequency(session: "StationSession", meta: "DutMeta") -> None:
         )
     if summaries:
         combined = pd.concat(summaries, ignore_index=True)
-        session.results["stability_summary"] = combined
-        session.log(f"Power and frequency stored {len(combined)} summary rows for report")
+        _append_summary(session, "stability_summary", combined)
+        stored = session.results["stability_summary"]
+        session.log(
+            f"Power and frequency stored {len(stored)} summary rows for report"
+        )
+
+
+def run_power_and_frequency_mux_dither_off(
+    session: "StationSession", meta: "DutMeta"
+) -> None:
+    """Turn MUX dither off, then collect the power/frequency trace for 6 min."""
+    osa = session.get("osa")
+    if session.tb is None or osa is None:
+        raise RuntimeError(
+            "Start the test station with testboard and osa before "
+            "power and frequency with MUX dither off."
+        )
+    note = meta.comment or f"acceptance power/freq MUX dither off DUT={meta.serial_number}"
+    selected_ids = set(session.results.get("selected_test_ids") or [])
+    prepare_tile = not ({"tap_ratios", "power_and_frequency"} & selected_ids)
+    session.log(
+        f"Power and frequency with MUX dither off starting for DUT "
+        f"{meta.serial_number!r}, tiles {meta.tile_indexes}, "
+        f"operator {meta.operator!r}"
+        + (
+            " (skipping re-init/power-on; an earlier test already prepared the tile)"
+            if not prepare_tile
+            else ""
+        )
+    )
+    summaries = []
+    for idx in meta.tile_indexes:
+        tile = _tile_from_session(session, idx)
+        session.log(f"Power and frequency with MUX dither off, tile {idx} (6 min) ...")
+        _raw_df, summary = clm_exp.clm_power_and_frequency_test(
+            tile,
+            osa,
+            session.cfg,
+            tb=session.tb,
+            tile_index=idx,
+            test_duration=60 * 6,
+            sample_interval=10,
+            settle_s=30,
+            prepare_tile=prepare_tile,
+            data_dir=session.output_dir(),
+            serial_number=meta.serial_number,
+            note=f"{note} tile={idx}",
+            log=session.log,
+            mux_dither=False,
+            csv_stem=f"clm_power_n_wavelength_stability_mux_dither_off_tile{idx}",
+            plot="power",
+            plot_heading="power vs time, MUX dither off",
+            log_name="Power and frequency, MUX dither off",
+        )
+        summaries.append(
+            clm_exp.stability_report_frame(summary, clm_exp.MUX_DITHER_OFF_STABILITY)
+        )
+        session.log(
+            f"Power and frequency with MUX dither off, tile {idx} finished: "
+            f"{len(summaries[-1])} channel rows"
+        )
+    if summaries:
+        combined = pd.concat(summaries, ignore_index=True)
+        _append_summary(session, "mux_dither_off_summary", combined)
+        stored = session.results.get("mux_dither_off_summary")
+        if stored is not None:
+            session.log(
+                f"MUX dither off stored {len(stored)} summary rows for report"
+            )
 
 
 def _report_spec_from_yaml(metric_names: list[str] | None = None) -> dict:
@@ -200,7 +270,7 @@ def _report_spec_from_yaml(metric_names: list[str] | None = None) -> dict:
     except Exception:
         yaml_spec = {}
     out = {}
-    for yaml_key, report_name in _SPEC_YAML_TO_REPORT.items():
+    for report_name, yaml_key in _REPORT_LIMIT_SOURCE.items():
         if metric_names is not None and report_name not in metric_names:
             continue
         entry = yaml_spec.get(yaml_key)
@@ -211,8 +281,14 @@ def _report_spec_from_yaml(metric_names: list[str] | None = None) -> dict:
             and len(entry[0]) == 2
         ):
             out[report_name] = [list(entry[0]), str(entry[1])]
-        elif report_name in clm_report.spec_config_dict:
-            out[report_name] = clm_report.spec_config_dict[report_name]
+            continue
+        fallback_name = (
+            report_name
+            if report_name in clm_report.spec_config_dict
+            else "15 min power stability"
+        )
+        if fallback_name in clm_report.spec_config_dict:
+            out[report_name] = clm_report.spec_config_dict[fallback_name]
     return out
 
 
@@ -248,10 +324,11 @@ def run_per_test(session: "StationSession", meta: "DutMeta") -> None:
             tb=session.tb,
             channels=range(8),
             temp0=25,
-            temp1=45,
-            channel_s=600,
+            temp1=50,
+            channel_s=300,
             channel_settle_s=20,
             tile_index=idx,
+            serial_number=meta.serial_number,
             prepare_tile=True,
             settle_s=30,
             note=f"{note} tile={idx}",
@@ -262,8 +339,30 @@ def run_per_test(session: "StationSession", meta: "DutMeta") -> None:
         session.log(f"PER tile {idx} finished: {len(summary)} summary rows")
     if summaries:
         combined = pd.concat(summaries, ignore_index=True)
-        session.results["per_summary"] = combined
-        session.log(f"PER stored {len(combined)} summary rows for report")
+        _append_summary(session, "per_summary", combined)
+        stored = session.results["per_summary"]
+        session.log(f"PER stored {len(stored)} summary rows for report")
+
+
+def _append_summary(session: "StationSession", key: str, frame: pd.DataFrame) -> None:
+    """Add rows to a report table. Later tiles must not replace earlier ones."""
+    if frame is None or len(frame) == 0:
+        return
+    existing = session.results.get(key)
+    if existing is not None and len(existing):
+        session.results[key] = pd.concat([existing, frame], ignore_index=True)
+    else:
+        session.results[key] = frame
+
+
+def _tile_meta(meta: "DutMeta", tile_index: int) -> "DutMeta":
+    """Same DUT record, restricted to the tile now under test."""
+    return DutMeta(
+        serial_number=meta.serial_number,
+        operator=meta.operator,
+        comment=meta.comment,
+        tile_indexes=[tile_index],
+    )
 
 
 def _fw_version_label(session: "StationSession", meta: "DutMeta") -> str:
@@ -297,18 +396,21 @@ def _fw_version_label(session: "StationSession", meta: "DutMeta") -> str:
 
 def generate_acceptance_report(session: "StationSession", meta: "DutMeta") -> None:
     """Write .docx / .html / .pdf after the selected acceptance tests finish."""
-    stability = session.results.get("stability_summary")
-    per_summary = session.results.get("per_summary")
-    frames = [frame for frame in (stability, per_summary) if frame is not None and len(frame)]
+    frames = [
+        frame
+        for frame in (
+            session.results.get("stability_summary"),
+            session.results.get("mux_dither_off_summary"),
+            session.results.get("per_summary"),
+        )
+        if frame is not None and len(frame)
+    ]
     if not frames:
         session.log("No reportable results yet; skipping test report.")
         return
-    if len(frames) == 1:
-        results = frames[0].copy()
-    else:
-        results = frames[0].merge(
-            frames[1], on=["tile", "bank", "channel"], how="outer"
-        )
+    results = frames[0].copy()
+    for frame in frames[1:]:
+        results = results.merge(frame, on=["tile", "bank", "channel"], how="outer")
     # Outer merge can promote tile/channel to float; keep them integers for the report.
     for col in ("tile", "channel"):
         if col in results.columns:
@@ -320,6 +422,7 @@ def generate_acceptance_report(session: "StationSession", meta: "DutMeta") -> No
             "wavelength error",
             "power error",
             "15 min power stability",
+            clm_exp.MUX_DITHER_OFF_STABILITY,
             "min PER",
         )
         if name in results.columns
@@ -372,9 +475,16 @@ ACCEPTANCE_TESTS: list[AcceptanceTest] = [
         run=run_power_and_frequency,
     ),
     AcceptanceTest(
+        "power_and_frequency_mux_dither_off",
+        "power and frequency with MUX dither off",
+        "Turn MUX dither off, then collect 6 min of the same OSA power and wavelength data. "
+        "Report section is power stability with MUX dither off, using the power stability limit.",
+        run=run_power_and_frequency_mux_dither_off,
+    ),
+    AcceptanceTest(
         "per",
         "PER",
-        "Dual-meter PER vs Arroyo ramp (25-45 C); A=ER-1000, B=ER-100.",
+        "Dual-meter PER vs Arroyo ramp (25-45 C, 300 s). Even channels ramp up, odd channels ramp down. A=ER-1000, B=ER-100.",
         run=run_per_test,
     ),
 ]
@@ -416,10 +526,18 @@ class StationSession:
     running: bool = False
     results: dict[str, Any] = field(default_factory=dict)
     run_dir: Path | None = None
+    log_lines: list[str] = field(default_factory=list, repr=False)
+    _log_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _log: Callable[[str], None] = field(default=lambda _msg: None, repr=False)
 
     def log(self, message: str) -> None:
         self._log(message)
+
+    def log_text(self) -> str:
+        with self._log_lock:
+            if not self.log_lines:
+                return ""
+            return "\n".join(self.log_lines) + "\n"
 
     def get(self, name: str) -> Any:
         return self.instruments.get(name)
@@ -488,8 +606,9 @@ class ClmAcceptanceTestGui(tk.Tk):
     def __init__(self, cfg: dict | None = None):
         super().__init__()
         self.title("CLM Acceptance Test")
-        self.geometry("780x560")
-        self.minsize(640, 480)
+        self._apply_ui_fonts()
+        self.geometry("1000x700")
+        self.minsize(820, 560)
         self._set_app_icon()
 
         self.cfg = cfg if cfg is not None else clm_exp.load_config(SCRIPT_DIR / "lab_config.yaml")
@@ -507,6 +626,13 @@ class ClmAcceptanceTestGui(tk.Tk):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _apply_ui_fonts(self) -> None:
+        """Use 12 pt for the form text. Tabs were 10; body text was 9 or 10."""
+        import tkinter.font as tkfont
+
+        for name in ("TkDefaultFont", "TkTextFont", "TkFixedFont"):
+            tkfont.nametofont(name).configure(size=12)
+
     def _set_app_icon(self) -> None:
         icon_path = SCRIPT_DIR / "assets" / "laser_diode.png"
         try:
@@ -519,8 +645,8 @@ class ClmAcceptanceTestGui(tk.Tk):
         style = ttk.Style(self)
         style.configure(
             "TNotebook.Tab",
-            font=("Segoe UI", 10, "bold"),
-            padding=[14, 5],
+            font=("Segoe UI", 12, "bold"),
+            padding=[16, 6],
         )
 
         notebook = ttk.Notebook(self)
@@ -593,7 +719,11 @@ class ClmAcceptanceTestGui(tk.Tk):
         self.close_button = ttk.Button(
             buttons, text="Close down", command=self._on_close_station
         )
-        self.close_button.pack(side=tk.LEFT)
+        self.close_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.self_test_button = ttk.Button(
+            buttons, text="Self test instruments", command=self._on_self_test
+        )
+        self.self_test_button.pack(side=tk.LEFT)
         return frame
 
     def _build_acceptance_tab(self, parent) -> ttk.Frame:
@@ -632,9 +762,13 @@ class ClmAcceptanceTestGui(tk.Tk):
         )
 
     def _append_log(self, message: str) -> None:
+        text = str(message)
+        with self.session._log_lock:
+            self.session.log_lines.append(text)
+
         def write() -> None:
             self.log_text.configure(state=tk.NORMAL)
-            self.log_text.insert(tk.END, message + "\n")
+            self.log_text.insert(tk.END, text + "\n")
             self.log_text.see(tk.END)
             self.log_text.configure(state=tk.DISABLED)
             self.status_var.set(
@@ -643,11 +777,29 @@ class ClmAcceptanceTestGui(tk.Tk):
 
         self.after(0, write)
 
+    def _save_acceptance_log(self) -> None:
+        """Write the log pane text into the run folder. Name includes SN and date."""
+        run_dir = self.session.run_dir
+        serial = str(self.session.results.get("log_serial") or "").strip()
+        started = self.session.results.get("log_started")
+        if run_dir is None or not serial or not isinstance(started, datetime):
+            return
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in serial) or "unknown"
+        stamp = started.strftime("%m-%d-%Y_%H-%M-%S")
+        path = Path(run_dir) / f"acceptance_log_{safe}_{stamp}.txt"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.session.log(f"Acceptance log: {path}")
+            path.write_text(self.session.log_text(), encoding="utf-8")
+        except Exception as exc:
+            self.session.log(f"WARNING: Could not save acceptance log: {exc}")
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         self.start_button.configure(state=state)
         self.close_button.configure(state=state)
+        self.self_test_button.configure(state=state)
 
     def _run_in_thread(self, work: Callable[[], None], label: str) -> None:
         if self._busy:
@@ -667,6 +819,8 @@ class ClmAcceptanceTestGui(tk.Tk):
                     lambda msg=err_msg: messagebox.showerror(label, msg),
                 )
             finally:
+                if label == "Acceptance test":
+                    self._save_acceptance_log()
                 self.after(0, lambda: self._set_busy(False))
 
         threading.Thread(target=runner, daemon=True).start()
@@ -689,6 +843,30 @@ class ClmAcceptanceTestGui(tk.Tk):
             "Close down",
         )
 
+    def _on_self_test(self) -> None:
+        def work() -> None:
+            results = clm_exp.run_equipment_self_tests(
+                self.session.instruments,
+                cfg=self.session.cfg,
+                log=self.session.log,
+            )
+            lines = [
+                f"{item['device']}: {'PASS' if item['passed'] else 'FAIL'}"
+                for item in results
+            ]
+            failed = any(not item["passed"] for item in results)
+            text = "\n".join(lines)
+            self.after(
+                0,
+                lambda: (
+                    messagebox.showwarning("Instrument self test", text)
+                    if failed
+                    else messagebox.showinfo("Instrument self test", text)
+                ),
+            )
+
+        self._run_in_thread(work, "Instrument self test")
+
     def _on_run_tests(self) -> None:
         selected = [
             test for test in ACCEPTANCE_TESTS if self._test_vars[test.test_id].get()
@@ -702,28 +880,21 @@ class ClmAcceptanceTestGui(tk.Tk):
             return
 
         selected_ids = {t.test_id for t in selected}
-        # One coupler fiber prompt for the run. Skip it for power/freq-only when
-        # tap-ratio is also selected — still prompt once here because tap needs it.
-        # If only power/freq is selected, prompt. If tap is selected (alone or with
-        # power/freq), prompt once up front.
-        needs_coupler_prompt = bool(
-            selected_ids & {"tap_ratios", "power_and_frequency"}
-        )
-        if needs_coupler_prompt:
-            proceed = messagebox.askyesno(
-                "Laser safety",
-                "please connect DUT  output to coupler input (A-->white, B-->blue).",
-            )
-            if not proceed:
-                self._append_log(
-                    "Laser safety: cancelled (No or dialog closed). No tests run."
-                )
-                return
+        # Coupler fibers are needed once per tile, just before that tile's
+        # first OSA test. PER asks for its own fibers when it starts.
+        coupler_test_ids = {
+            "tap_ratios",
+            "power_and_frequency",
+            "power_and_frequency_mux_dither_off",
+        }
+        needs_coupler_prompt = bool(selected_ids & coupler_test_ids)
 
         def work() -> None:
             self.session.clear_results()
-            self.session.results["selected_test_ids"] = sorted(selected_ids)
             now = datetime.now()
+            self.session.results["selected_test_ids"] = sorted(selected_ids)
+            self.session.results["log_serial"] = meta.serial_number
+            self.session.results["log_started"] = now
             run_dir = (
                 Path(self.session.cfg.get("data_dir", "."))
                 / f"_{meta.serial_number}_{now.day}_{now.month}_{now.year}"
@@ -737,24 +908,60 @@ class ClmAcceptanceTestGui(tk.Tk):
                 note_path.write_text(meta.comment + "\n", encoding="utf-8")
                 self.session.log(f"Operator note: {note_path}")
             self.session.log(
-                f"Running {len(selected)} test(s) for DUT {meta.serial_number}"
+                f"Running {len(selected)} test(s) on each of "
+                f"{meta.tile_indexes} for DUT {meta.serial_number}"
             )
             run_t0 = time.perf_counter()
-            for test in selected:
-                self.session.log(f"--- {test.label} ---")
-                test_t0 = time.perf_counter()
-                if test.run is None:
-                    self.session.log(f"{test.label}: no runner registered")
-                else:
-                    test.run(self.session, meta)
-                elapsed = time.perf_counter() - test_t0
+            ran_any = False
+            stop_run = False
+            for idx in meta.tile_indexes:
+                self.session.cfg["tile_index"] = int(idx)
+                tile_meta = _tile_meta(meta, idx)
+                self.session.log(f"=== Tile {idx} ===")
+                tile_t0 = time.perf_counter()
+                asked_coupler = False
+                for test in selected:
+                    if (
+                        needs_coupler_prompt
+                        and not asked_coupler
+                        and test.test_id in coupler_test_ids
+                    ):
+                        asked_coupler = True
+                        proceed = messagebox.askyesno(
+                            "Laser safety",
+                            f"Tile {idx}: please connect DUT output to coupler "
+                            "input (A-->white, B-->blue).",
+                        )
+                        if not proceed:
+                            self.session.log(
+                                f"Laser safety: cancelled for tile {idx} "
+                                "(No or dialog closed). Remaining tiles will not run."
+                            )
+                            stop_run = True
+                            break
+                    self.session.log(f"--- Tile {idx}: {test.label} ---")
+                    test_t0 = time.perf_counter()
+                    if test.run is None:
+                        self.session.log(f"{test.label}: no runner registered")
+                    else:
+                        test.run(self.session, tile_meta)
+                    ran_any = True
+                    elapsed = time.perf_counter() - test_t0
+                    self.session.log(
+                        f"Tile {idx} {test.label}: elapsed {_format_elapsed(elapsed)}"
+                    )
                 self.session.log(
-                    f"{test.label}: elapsed {_format_elapsed(elapsed)}"
+                    f"Tile {idx} elapsed {_format_elapsed(time.perf_counter() - tile_t0)}"
                 )
+                if stop_run:
+                    break
             total_elapsed = time.perf_counter() - run_t0
             self.session.log(
                 f"Selected tests total elapsed: {_format_elapsed(total_elapsed)}"
             )
+            if not ran_any:
+                self.session.log("No tests ran.")
+                return
             self.session.log("Selected tests finished.")
             generate_acceptance_report(self.session, meta)
             self.session.log("Closing test station after acceptance run...")

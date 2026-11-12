@@ -217,6 +217,7 @@ def _station_handlers():
         "per_meter": (open_per_meter, _close_station_instrument),
         "per_meter_er100": (open_per_meter_er100, _close_station_instrument),
         "osa": (open_osa, _close_station_instrument),
+        "opm": (open_opm, _close_opm),
     }
 
 
@@ -327,11 +328,17 @@ def bank_for(bank_index):
     return banks[bank_index]
 
 
-def record_condition(tile, enable_mask, sample_s, interval_s, **tags):
-    """Enable lanes, record, and attach the mask plus any extra columns."""
+def record_condition(tile, enable_mask, sample_s, interval_s, tweakT_PIC=False, **tags):
+    """Enable lanes, record, and attach the mask plus any extra columns.
+
+    tweakT_PIC is forwarded to get_clm_record. It is not a tag column.
+    """
     mca.clm_lane_enable(tile, chEnableMask=list(enable_mask))
     records, columns = mca.get_clm_record(
-        [tile], duration_s=sample_s, interval_s=interval_s
+        [tile],
+        duration_s=sample_s,
+        interval_s=interval_s,
+        tweakT_PIC=tweakT_PIC,
     )
     frame = pd.DataFrame(records, columns=columns)
     for key, value in tags.items():
@@ -526,6 +533,63 @@ def power_range_sweep(
     )
 
 
+def power_level_sweep(
+    tile,
+    data_dir,
+    power_targets=(6, 8, 10, 12),
+    duration_s=300,
+    interval_s=2,
+    tweakT_PIC=False,
+    tile_index=None,
+    note="",
+):
+    """Hold all 16 lanes at each power target for duration_s.
+
+    Each dwell is sampled by get_clm_record at interval_s. tweakT_PIC is
+    passed through to that call. et_run_s is elapsed time across the whole
+    sweep; et_s restarts inside each dwell.
+    """
+    power_targets = list(power_targets)
+    all_lanes = [1] * N_LANES
+    stem = (
+        f"clm power level sweep_duration-{duration_s}_interval-{interval_s}"
+        f"_tweakTpic-{int(bool(tweakT_PIC))}"
+    )
+    params = {
+        "duration_s": duration_s,
+        "interval_s": interval_s,
+        "tweakT_PIC": bool(tweakT_PIC),
+        "note": note,
+    }
+    if tile_index is not None:
+        params["tile_index"] = tile_index
+    frames = []
+    offset = 0.0
+    try:
+        for power_target in tqdm(power_targets, desc="power tgt"):
+            mca.set_clm_output_targets(tile, [0] * N_LANES, [power_target] * N_LANES)
+            frame = record_condition(
+                tile,
+                all_lanes,
+                duration_s,
+                interval_s,
+                tweakT_PIC=tweakT_PIC,
+                pow_tgt=power_target,
+            )
+            frame["et_run_s"] = frame["et_s"] + offset
+            if len(frame):
+                offset = float(frame["et_run_s"].max())
+            frames.append(frame)
+    except KeyboardInterrupt:
+        print("Interrupted. Saving samples collected so far.")
+        return _finish_frames(frames, data_dir, stem + "_partial", params)
+    except Exception:
+        print("Saving samples collected before the error.")
+        _finish_frames(frames, data_dir, stem + "_partial", params)
+        raise
+    return _finish_frames(frames, data_dir, stem, params)
+
+
 def _reinitialize_tile(tb, tile):
     mca.clm_lane_enable(tile, chEnableMask=[0] * N_LANES)
     mca.initialize_tile(tb, tile=tile)
@@ -673,6 +737,25 @@ def open_osa(cfg):
     return YokogawaOSA(cfg["osa_visa"])
 
 
+def open_opm(cfg):
+    """Open the Keysight N7745C optical power meter at cfg['opm_visa']."""
+    from instrument_drivers.devices.keysight_N7745c_opm import KeysightN7745C
+
+    opm = KeysightN7745C(cfg["opm_visa"])
+    print(opm.connect().strip())
+    return opm
+
+
+def _close_opm(opm):
+    if opm is None:
+        return
+    disconnect = getattr(opm, "disconnect", None)
+    if callable(disconnect):
+        disconnect()
+        return
+    _close_station_instrument(opm)
+
+
 def set_temperature(tec_thorlab, tec_arroyo, temp_c):
     """Set the same target, in degrees C, on both TECs."""
     tec_thorlab.set_target_temperature(int(round(1000 * temp_c)))
@@ -682,6 +765,115 @@ def set_temperature(tec_thorlab, tec_arroyo, temp_c):
 def set_temperature_arroyo(tec_arroyo, temp_c):
     """Set Arroyo TEC target only (degrees C)."""
     tec_arroyo.set_temp(float(temp_c))
+
+
+def _arroyo_flush_input(tec_arroyo):
+    """Drop unread serial bytes so the next query is not a stale reply.
+
+    The Arroyo port is non-blocking. ``TEC:OUT 1`` can leave an echo or the
+    previous ``0`` in the buffer, and the driver's immediate readback then
+    reports the output as still off.
+    """
+    com = getattr(tec_arroyo, "com", None)
+    if com is None:
+        return
+    try:
+        com.reset_input_buffer()
+    except Exception:
+        pass
+
+
+def _arroyo_write(tec_arroyo, command):
+    """Send one command terminated by CR/LF, with no trailing space.
+
+    ``ArroyoInstrument.write`` appends `` \\r\\n``. That extra space makes an
+    integer argument such as ``TEC:OUT 1`` fail with E-202 Invalid data type.
+    """
+    payload = str(command).strip() + "\r\n"
+    _arroyo_flush_input(tec_arroyo)
+    tec_arroyo.com.write(payload.encode("ascii"))
+    time.sleep(0.15)
+
+
+def _arroyo_query_text(tec_arroyo, command):
+    _arroyo_flush_input(tec_arroyo)
+    return str(tec_arroyo.query(command)).strip()
+
+
+def _arroyo_last_int(text):
+    """Last integer in a reply. An echoed command must not hide the value."""
+    numbers = []
+    for piece in str(text).replace(",", " ").split():
+        token = piece.strip().strip('"')
+        try:
+            numbers.append(int(float(token)))
+        except ValueError:
+            continue
+    if not numbers:
+        raise ValueError(f"no integer in Arroyo response {text!r}")
+    return numbers[-1]
+
+
+def _arroyo_output_state(tec_arroyo):
+    text = _arroyo_query_text(tec_arroyo, "TEC:OUT?")
+    return _arroyo_last_int(text), text
+
+
+def _arroyo_error_text(tec_arroyo):
+    try:
+        text = _arroyo_query_text(tec_arroyo, "ERRSTR?")
+    except Exception as exc:
+        return f"ERRSTR? failed: {exc}"
+    if not text or text.strip() in ("0", "0,0"):
+        return ""
+    return text.strip()
+
+
+def ensure_arroyo_tec_enabled(tec_arroyo, log=print):
+    """Turn the Arroyo TEC output on so the control loop tracks the setpoint.
+
+    ``TEC:T`` only stores the setpoint. With ``TEC:OUT`` off, the commanded
+    temperature moves and the measured temperature stays put. The status is
+    read after the serial input buffer is cleared, because a stale ``0``
+    left by the enable command otherwise looks like a failed enable.
+    """
+    output, raw = _arroyo_output_state(tec_arroyo)
+    if output == 1:
+        log("Arroyo TEC control loop is enabled.")
+        return
+    try:
+        mode = _arroyo_query_text(tec_arroyo, "TEC:MODE?")
+    except Exception:
+        mode = ""
+    if mode.split(",")[0].strip().upper() not in ("T", "TEMP", "TEMPERATURE"):
+        log(f"Arroyo TEC mode is {mode or 'unknown'}; setting temperature mode.")
+        _arroyo_write(tec_arroyo, "TEC:MODE:T")
+    # Drop E-202 left by an earlier "TEC:OUT 1 " (trailing space) command.
+    _arroyo_error_text(tec_arroyo)
+    log(f"Arroyo TEC output is {raw}; enabling the control loop.")
+    last_detail = raw
+    for attempt in range(1, 4):
+        _arroyo_write(tec_arroyo, "TEC:OUT 1")
+        time.sleep(0.25)
+        try:
+            output, raw = _arroyo_output_state(tec_arroyo)
+        except Exception as exc:
+            last_detail = str(exc)
+            log(f"Arroyo TEC output readback failed on attempt {attempt}: {exc}")
+            continue
+        if output == 1:
+            log("Arroyo TEC control loop is enabled.")
+            return
+        error_text = _arroyo_error_text(tec_arroyo)
+        last_detail = f"TEC:OUT? {raw}"
+        if error_text:
+            last_detail = f"{last_detail}; {error_text}"
+        log(f"Arroyo TEC output still off after attempt {attempt}: {last_detail}")
+    raise RuntimeError(
+        "Arroyo TEC control loop is not enabled (TEC:OUT). "
+        f"{last_detail}. "
+        "The setpoint can change, but measured temperature will not follow."
+    )
 
 
 def read_tec_state(tec_thorlab, tec_arroyo):
@@ -702,6 +894,431 @@ def read_tec_state(tec_thorlab, tec_arroyo):
         "curr_arroyo": tec_arroyo.get_curr(),
         "volt_arroyo": tec_arroyo.get_volt(),
     }
+
+
+def _finite(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number not in (float("inf"), float("-inf"))
+
+
+def _offset_setpoint(current, delta, low, high):
+    """Pick current+delta, or current-delta if that stays inside low..high."""
+    trial = current + delta
+    if trial < low or trial > high:
+        trial = current - delta
+    if trial < low or trial > high or trial == current:
+        raise ValueError(
+            f"setpoint {current} has no room for a {delta} step inside {low}..{high}"
+        )
+    return trial
+
+
+class _SelfTest:
+    """Collect pass/fail lines for one instrument and echo them to the log."""
+
+    def __init__(self, device, log=print):
+        self.device = device
+        self.log = log
+        self.checks = []
+
+    def add(self, name, passed, detail):
+        self.checks.append({
+            "name": name,
+            "passed": bool(passed),
+            "detail": str(detail),
+        })
+        mark = "PASS" if passed else "FAIL"
+        self.log(f"  [{mark}] {self.device} {name}: {detail}")
+
+    def result(self):
+        passed = bool(self.checks) and all(item["passed"] for item in self.checks)
+        mark = "PASS" if passed else "FAIL"
+        self.log(f"{self.device} self test {mark}")
+        return {"device": self.device, "passed": passed, "checks": self.checks}
+
+
+def _ptc_call(tec_thorlab, method, label):
+    """Call a PTC1 getter that fills a one-element list. Raises on a bad status."""
+    slot = [0]
+    status = method(slot)
+    if status != 0:
+        raise RuntimeError(f"{label} failed with status {status}")
+    return slot[0]
+
+
+def self_test_thorlab(tec_thorlab, log=print, delta_c=1.0):
+    """Check the Thorlabs PTC1 setpoint, sensor, and loop telemetry.
+
+    Writes a 1 C trial target, reads it back, then restores the original
+    target. The PTC1 SDK has no TEC output-enable command, so loop status
+    is USB mode, a clear error register, and a live current and voltage read.
+    """
+    report = _SelfTest("Thorlabs TEC", log)
+    original_mc = None
+    try:
+        ident = _ptc_call(tec_thorlab, tec_thorlab.get_id, "identity")
+        report.add("identity", bool(str(ident).strip()), str(ident).strip() or "empty identity")
+    except Exception as exc:
+        report.add("identity", False, exc)
+        return report.result()
+
+    try:
+        mode = int(_ptc_call(tec_thorlab, tec_thorlab.get_mode, "mode"))
+        report.add(
+            "loop status",
+            mode == 0,
+            "USB mode" if mode == 0 else f"knob mode ({mode}); remote control is not active",
+        )
+    except Exception as exc:
+        report.add("loop status", False, exc)
+
+    try:
+        error = int(_ptc_call(tec_thorlab, tec_thorlab.get_error, "error register"))
+        report.add("error register", error == 0, f"0x{error:X}")
+    except Exception as exc:
+        report.add("error register", False, exc)
+
+    try:
+        actual_mc = int(_ptc_call(
+            tec_thorlab, tec_thorlab.get_actual_temperature, "actual temperature"
+        ))
+        min_mc = int(_ptc_call(tec_thorlab, tec_thorlab.get_min_temperature, "min temperature"))
+        max_mc = int(_ptc_call(tec_thorlab, tec_thorlab.get_max_temperature, "max temperature"))
+        in_range = min_mc <= actual_mc <= max_mc
+        report.add(
+            "temperature read",
+            in_range,
+            f"{actual_mc / 1000:.3f} C (limits {min_mc / 1000:.1f}..{max_mc / 1000:.1f} C)",
+        )
+    except Exception as exc:
+        report.add("temperature read", False, exc)
+
+    try:
+        current_ma = int(_ptc_call(tec_thorlab, tec_thorlab.get_actual_current, "current"))
+        voltage_mv = int(_ptc_call(tec_thorlab, tec_thorlab.get_actual_voltage, "voltage"))
+        sane = abs(current_ma) <= 3000 and abs(voltage_mv) <= 20000
+        report.add(
+            "current and voltage",
+            sane,
+            f"{current_ma / 1000:.3f} A, {voltage_mv / 1000:.3f} V",
+        )
+    except Exception as exc:
+        report.add("current and voltage", False, exc)
+
+    try:
+        original_mc = int(_ptc_call(
+            tec_thorlab, tec_thorlab.get_target_temperature, "target temperature"
+        ))
+        low_mc = int(_ptc_call(tec_thorlab, tec_thorlab.get_min_temperature, "min temperature"))
+        high_mc = int(_ptc_call(tec_thorlab, tec_thorlab.get_max_temperature, "max temperature"))
+        # The DLL documents 5 C to 45 C. Stay inside both that and the device limits.
+        low_mc = max(low_mc, 5000)
+        high_mc = min(high_mc, 45000)
+        trial_mc = int(_offset_setpoint(original_mc, int(round(delta_c * 1000)), low_mc, high_mc))
+        status = tec_thorlab.set_target_temperature(trial_mc)
+        readback_mc = int(_ptc_call(
+            tec_thorlab, tec_thorlab.get_target_temperature, "target readback"
+        ))
+        report.add(
+            "temperature set",
+            status == 0 and readback_mc == trial_mc,
+            f"wrote {trial_mc / 1000:.3f} C, read {readback_mc / 1000:.3f} C",
+        )
+    except Exception as exc:
+        report.add("temperature set", False, exc)
+    finally:
+        if original_mc is not None:
+            try:
+                tec_thorlab.set_target_temperature(int(original_mc))
+                restored = int(_ptc_call(
+                    tec_thorlab, tec_thorlab.get_target_temperature, "restore target"
+                ))
+                report.add(
+                    "setpoint restored",
+                    restored == int(original_mc),
+                    f"{restored / 1000:.3f} C",
+                )
+            except Exception as exc:
+                report.add("setpoint restored", False, exc)
+    return report.result()
+
+
+def self_test_arroyo(tec_arroyo, log=print, delta_c=1.0, low_c=5.0, high_c=50.0):
+    """Check Arroyo temperature set/read and that the control loop is on.
+
+    Writes a 1 C trial setpoint, reads it back, then restores the original
+    setpoint. Loop status passes only when the mode is temperature and
+    TEC:OUT is on. Measured temperature is read, but it is not required to
+    equal the setpoint.
+    """
+    report = _SelfTest("Arroyo TEC", log)
+    original_c = None
+    try:
+        ident = str(tec_arroyo.get_id()).strip()
+        report.add("identity", bool(ident), ident or "empty identity")
+    except Exception as exc:
+        report.add("identity", False, exc)
+
+    try:
+        mode = str(tec_arroyo.get_mode()).strip()
+        output = int(tec_arroyo.get_output())
+        temperature_mode = mode.split(",")[0].strip().upper() in ("T", "TEMP", "TEMPERATURE")
+        report.add(
+            "loop status",
+            temperature_mode and output == 1,
+            f"mode {mode or 'blank'}, TEC:OUT {output}",
+        )
+    except Exception as exc:
+        report.add("loop status", False, exc)
+
+    try:
+        measured_c = float(tec_arroyo.get_temp())
+        report.add(
+            "temperature read",
+            _finite(measured_c) and low_c <= measured_c <= 90.0,
+            f"{measured_c:.3f} C, {float(tec_arroyo.get_curr()):.3f} A, "
+            f"{float(tec_arroyo.get_volt()):.3f} V",
+        )
+    except Exception as exc:
+        report.add("temperature read", False, exc)
+
+    try:
+        original_c = float(tec_arroyo.get_set_temp())
+        trial_c = float(_offset_setpoint(original_c, float(delta_c), low_c, high_c))
+        tec_arroyo.set_temp(trial_c)
+        readback_c = float(tec_arroyo.get_set_temp())
+        report.add(
+            "temperature set",
+            abs(readback_c - trial_c) <= 0.05,
+            f"wrote {trial_c:.3f} C, read {readback_c:.3f} C",
+        )
+    except Exception as exc:
+        report.add("temperature set", False, exc)
+    finally:
+        if original_c is not None:
+            try:
+                tec_arroyo.set_temp(float(original_c))
+                restored_c = float(tec_arroyo.get_set_temp())
+                report.add(
+                    "setpoint restored",
+                    abs(restored_c - float(original_c)) <= 0.05,
+                    f"{restored_c:.3f} C",
+                )
+            except Exception as exc:
+                report.add("setpoint restored", False, exc)
+    return report.result()
+
+
+def _osa_no_error(osa):
+    error = osa.query("SYST:ERR?").strip()
+    return error, error.startswith("0") or error.startswith("+0")
+
+
+def self_test_osa(osa, log=print, sweep_timeout_s=120):
+    """Check OSA identity, the wavelength window, one sweep, and the error queue.
+
+    Uses the wavelength window already on the instrument. The sweep must
+    finish, and the peak marker must land inside that window.
+    """
+    report = _SelfTest("OSA", log)
+    try:
+        ident = str(osa.get_id()).strip()
+        report.add("identity", bool(ident), ident or "empty identity")
+    except Exception as exc:
+        report.add("identity", False, exc)
+        return report.result()
+
+    start_nm = stop_nm = None
+    try:
+        start_nm = float(osa.query(":SENS:WAV:STAR?")) * 1e9
+        stop_nm = float(osa.query(":SENS:WAV:STOP?")) * 1e9
+        resolution_nm = float(osa.get_resolution_bandwidth())
+        window_ok = _finite(start_nm) and _finite(stop_nm) and start_nm < stop_nm
+        report.add(
+            "wavelength window",
+            window_ok and _finite(resolution_nm) and resolution_nm > 0,
+            f"{start_nm:.3f} to {stop_nm:.3f} nm, resolution {resolution_nm:.4f} nm",
+        )
+    except Exception as exc:
+        report.add("wavelength window", False, exc)
+
+    try:
+        log(f"  OSA sweep started (timeout {sweep_timeout_s:.0f} s)")
+        osa.sweep_done = False
+        osa.clear()
+        osa.write(":INIT:SMODE SINGLE")
+        osa.write(":INIT")
+        deadline = time.monotonic() + sweep_timeout_s
+        finished = False
+        while time.monotonic() < deadline:
+            status = int(osa.query(":STAT:OPER:EVEN?"))
+            if status & 1:
+                finished = True
+                osa.sweep_done = True
+                break
+            time.sleep(0.2)
+        if not finished:
+            report.add("sweep", False, f"did not finish within {sweep_timeout_s:.0f} s")
+        else:
+            osa.write(":CALC:MARK1:MAX")
+            peak_nm = float(osa.query(":CALC:MARK1:X?")) * 1e9
+            peak_dbm = float(osa.query(":CALC:MARK1:Y?"))
+            in_window = start_nm is not None and (start_nm - 1.0) <= peak_nm <= (stop_nm + 1.0)
+            power_ok = _finite(peak_dbm) and -200.0 <= peak_dbm <= 40.0
+            report.add(
+                "sweep",
+                in_window and power_ok,
+                f"peak {peak_nm:.3f} nm at {peak_dbm:.2f} dBm",
+            )
+    except Exception as exc:
+        report.add("sweep", False, exc)
+
+    try:
+        error, ok = _osa_no_error(osa)
+        report.add("error queue", ok, error)
+    except Exception as exc:
+        report.add("error queue", False, exc)
+    return report.result()
+
+
+def _opm_wavelength_nm(opm, channel):
+    return float(opm.device.query(f"SENS{channel}:POW:WAV?")) * 1e9
+
+
+def self_test_opm(opm, log=print, channels=(1, 2, 3, 4), wavelength_nm=1310.0):
+    """Check the Keysight OPM identity, wavelength set/read, and a power read.
+
+    Each channel is set to wavelength_nm and then restored to the wavelength
+    it had at the start of that channel's check. A dark port still passes
+    when the power reading is a finite number.
+    """
+    report = _SelfTest("OPM", log)
+    device = getattr(opm, "device", None)
+    if device is None:
+        report.add("identity", False, "OPM is not connected")
+        return report.result()
+    try:
+        device.write("*CLS")
+        ident = str(opm.identify()).strip()
+        report.add("identity", "N774" in ident.upper() or "KEYSIGHT" in ident.upper(), ident or "empty identity")
+    except Exception as exc:
+        report.add("identity", False, exc)
+        return report.result()
+
+    for channel in channels:
+        original_nm = None
+        try:
+            original_nm = _opm_wavelength_nm(opm, channel)
+            opm.set_wavelength(channel, float(wavelength_nm))
+            readback_nm = _opm_wavelength_nm(opm, channel)
+            report.add(
+                f"channel {channel} wavelength",
+                abs(readback_nm - float(wavelength_nm)) <= 0.1,
+                f"wrote {float(wavelength_nm):.3f} nm, read {readback_nm:.3f} nm",
+            )
+        except Exception as exc:
+            report.add(f"channel {channel} wavelength", False, exc)
+        finally:
+            if original_nm is not None:
+                try:
+                    opm.set_wavelength(channel, float(original_nm))
+                except Exception as exc:
+                    report.add(f"channel {channel} wavelength restored", False, exc)
+        try:
+            power = float(opm.read_power(channel))
+            report.add(
+                f"channel {channel} power",
+                _finite(power),
+                f"{power:.3f}",
+            )
+        except Exception as exc:
+            report.add(f"channel {channel} power", False, exc)
+
+    try:
+        error = str(opm.get_errors()).strip()
+        report.add("error queue", error.startswith("0") or error.startswith("+0"), error)
+    except Exception as exc:
+        report.add("error queue", False, exc)
+    return report.result()
+
+
+def _missing_instrument(device, detail, log):
+    report = _SelfTest(device, log)
+    report.add("connection", False, detail)
+    return report.result()
+
+
+def run_equipment_self_tests(instruments=None, cfg=None, log=print, opm_channels=(1, 2, 3, 4)):
+    """Run TEC, OSA, and OPM self tests on handles that are already open.
+
+    Thorlabs TEC, Arroyo TEC, and the OSA are not opened here. Start the
+    test station first. The OPM is opened from cfg['opm_visa'] when it is
+    not already in ``instruments``, and that temporary connection is closed
+    before return.
+    """
+    instruments = instruments or {}
+    cfg = cfg or {}
+    log("Instrument self test")
+    results = []
+
+    thorlab = instruments.get("tec_thorlab")
+    if thorlab is None:
+        results.append(_missing_instrument(
+            "Thorlabs TEC", "not open. Start the test station first.", log
+        ))
+    else:
+        results.append(self_test_thorlab(thorlab, log=log))
+
+    arroyo = instruments.get("tec_arroyo")
+    if arroyo is None:
+        results.append(_missing_instrument(
+            "Arroyo TEC", "not open. Start the test station first.", log
+        ))
+    else:
+        results.append(self_test_arroyo(arroyo, log=log))
+
+    osa = instruments.get("osa")
+    if osa is None:
+        results.append(_missing_instrument(
+            "OSA", "not open. Start the test station first.", log
+        ))
+    else:
+        results.append(self_test_osa(osa, log=log))
+
+    opm = instruments.get("opm")
+    opened_opm = None
+    if opm is None:
+        if not cfg.get("opm_visa"):
+            results.append(_missing_instrument(
+                "OPM", "opm_visa is not set in lab_config.yaml", log
+            ))
+        else:
+            try:
+                log(f"  opening OPM at {cfg['opm_visa']}")
+                opened_opm = open_opm(cfg)
+                opm = opened_opm
+            except Exception as exc:
+                results.append(_missing_instrument("OPM", f"open failed: {exc}", log))
+    if opm is not None:
+        try:
+            results.append(self_test_opm(opm, log=log, channels=opm_channels))
+        finally:
+            if opened_opm is not None:
+                try:
+                    _close_opm(opened_opm)
+                    log("  OPM closed")
+                except Exception as exc:
+                    log(f"  OPM close failed: {exc}")
+
+    failed = [item["device"] for item in results if not item["passed"]]
+    if failed:
+        log("Instrument self test finished. Failed: " + ", ".join(failed))
+    else:
+        log("Instrument self test finished. All passed.")
+    return results
 
 
 def read_tec_state_arroyo(tec_arroyo):
@@ -1012,6 +1629,22 @@ def triangle_setpoint(elapsed_s, duration_s, temp0, temp1):
     return float(temp1 + (temp0 - temp1) * ((elapsed_s - half) / half))
 
 
+def one_way_setpoint(elapsed_s, duration_s, start, end):
+    """Linear setpoint from start to end across duration_s."""
+    if elapsed_s <= 0 or duration_s <= 0:
+        return float(start)
+    if elapsed_s >= duration_s:
+        return float(end)
+    return float(start + (end - start) * (elapsed_s / duration_s))
+
+
+def channel_ramp_limits(channel, temp0, temp1):
+    """Even channels ramp temp0 to temp1. Odd channels ramp temp1 to temp0."""
+    if int(channel) % 2 == 0:
+        return float(temp0), float(temp1)
+    return float(temp1), float(temp0)
+
+
 def per_over_temp_3(
     tile,
     tec_thorlab,
@@ -1061,6 +1694,7 @@ def per_over_temp_3(
         per_meter.stop(flush=True)
         per_meter.set_mode("er")
         per_meter.set_capture(True)
+        ensure_arroyo_tec_enabled(tec_arroyo)
         set_temperature(tec_thorlab, tec_arroyo, temp0)
         for channel in tqdm(channels, desc="channel"):
             mca.clm_lane_enable(
@@ -1369,17 +2003,35 @@ def _uw_to_dbm(power_uw):
     return 10.0 * np.log10(power_uw / 1000.0)
 
 
-def _strongest_peaks(wavelength_nm, power_dbm, count=16):
-    """Return the count strongest peaks from scipy, sorted by wavelength."""
+def _strongest_peaks(wavelength_nm, power_dbm, count=16, floor_db=10.0):
+    """Return the count strongest peaks from scipy, sorted by wavelength.
+
+    Samples more than floor_db below the trace maximum are clipped to that
+    floor before the peak search, so weak peaks are ignored. Returned powers
+    are the original samples, not the clipped values.
+    """
     from scipy.signal import find_peaks
 
     wavelength_nm = np.asarray(wavelength_nm, dtype=float)
     power_dbm = np.asarray(power_dbm, dtype=float)
-    maxima, _ = find_peaks(power_dbm)
-    print(f"OSA trace peaks: {len(maxima)}")
-    if len(maxima) < count:
-        raise ValueError(f"Expected at least {count} OSA peaks, found {len(maxima)}")
-    strongest = maxima[np.argsort(power_dbm[maxima])[-count:]]
+    if power_dbm.size == 0 or not np.any(np.isfinite(power_dbm)):
+        raise ValueError("OSA trace has no finite power samples")
+    threshold = float(np.nanmax(power_dbm) - floor_db)
+    clipped = np.where(np.isfinite(power_dbm), power_dbm, threshold)
+    np.maximum(clipped, threshold, out=clipped)
+    maxima, _ = find_peaks(clipped)
+    above = maxima[power_dbm[maxima] > threshold]
+    print(
+        f"OSA trace peaks: {len(maxima)} local maxima, "
+        f"{len(above)} above {threshold:.2f} dBm "
+        f"({floor_db:g} dB below the maximum)"
+    )
+    if len(above) < count:
+        raise ValueError(
+            f"Expected at least {count} OSA peaks within {floor_db:g} dB of "
+            f"the maximum, found {len(above)}"
+        )
+    strongest = above[np.argsort(power_dbm[above])[-count:]]
     order = np.argsort(wavelength_nm[strongest])
     chosen = strongest[order]
     return wavelength_nm[chosen], power_dbm[chosen]
@@ -1861,8 +2513,10 @@ def clm_power_n_wavelength_stability(
     peaks. The loss arrays returned by that call are not used. clm_osa_loss_A
     and clm_osa_loss_B are the calibration losses supplied by the caller.
     OSA peak power plus that loss is the OSA power referred back to the CLM.
-    idx_tile is written on every row. wavelength_error_nm is the OSA peak
-    minus the Kurtz grid wavelength for that bank and channel.
+    Each row also stores that channel's LD and VOA bias in mA, and the tile
+    PIC temperature in C as T_PIC. idx_tile is written on every row.
+    wavelength_error_nm is the OSA peak minus the Kurtz grid wavelength for
+    that bank and channel.
     """
     loss_A = np.asarray(clm_osa_loss_A, dtype=float)
     loss_B = np.asarray(clm_osa_loss_B, dtype=float)
@@ -1880,6 +2534,7 @@ def clm_power_n_wavelength_stability(
         "clm_power_uW", "clm_power_dBm",
         "osa_peak_power_dBm", "osa_peak_wavelength_nm", "wavelength_error_nm",
         "clm_osa_loss_dB", "power_from_osa_dBm",
+        "LD_mA", "VOA_mA", "T_PIC",
     ]
     frames = []
     t0 = time.monotonic()
@@ -1893,16 +2548,17 @@ def clm_power_n_wavelength_stability(
             if time.monotonic() >= deadline:
                 break
             sample = clm_to_OSA_loss_cal(tile, osa, trace=trace)
+            live = read_live_laser_voa_pic_temp(tile)
             et_s = round(time.monotonic() - t0, 1)
             stamp = _now()
             rows = []
             banks = (
-                ("A", sample["clm_power_A"], sample["osa_peak_power_A"],
+                ("A", 0, sample["clm_power_A"], sample["osa_peak_power_A"],
                  sample["osa_peak_wavelength_A"], loss_A),
-                ("B", sample["clm_power_B"], sample["osa_peak_power_B"],
+                ("B", 8, sample["clm_power_B"], sample["osa_peak_power_B"],
                  sample["osa_peak_wavelength_B"], loss_B),
             )
-            for bank, clm_uw, osa_dbm, wavelength_nm, loss_db in banks:
+            for bank, bank_offset, clm_uw, osa_dbm, wavelength_nm, loss_db in banks:
                 clm_dbm = _uw_to_dbm(clm_uw)
                 for channel in range(8):
                     rows.append({
@@ -1920,6 +2576,9 @@ def clm_power_n_wavelength_stability(
                         ),
                         "clm_osa_loss_dB": loss_db[channel],
                         "power_from_osa_dBm": osa_dbm[channel] + loss_db[channel],
+                        "LD_mA": live["laser"][bank_offset + channel],
+                        "VOA_mA": live["voa"][bank_offset + channel],
+                        "T_PIC": live["temp_pic"],
                     })
             frames.append(pd.DataFrame(rows, columns=columns))
             print(f"sample et_s={et_s}")
@@ -1931,23 +2590,67 @@ def clm_power_n_wavelength_stability(
     return pd.concat(frames, ignore_index=True)
 
 
-def summarize_clm_stability(df, power_tgt_mw=8):
+STABILITY_METRIC = "15 min power stability"
+MUX_DITHER_OFF_STABILITY = "power stability with MUX dither off"
+
+
+def set_mux_dither_enable(tile, enable, log=print):
+    """Write MuxDitherEnable on both banks and require the read-back to match."""
+    if tile is None:
+        raise ValueError("tile handle is required")
+    wanted = bool(enable)
+    for bank in mca.ClmTile.Bank:
+        bank_i = int(bank)
+        name = "A" if bank_i == 0 else "B"
+        tile.write_mux_dither_enable(bank_i, wanted)
+        state = bool(tile.read_mux_dither_enable(bank_i))
+        log(f"MUX dither bank {name}: {'on' if state else 'off'}")
+        if state != wanted:
+            raise RuntimeError(
+                f"MUX dither bank {name} read back {'on' if state else 'off'} "
+                f"after write {'on' if wanted else 'off'}."
+            )
+
+
+def stability_report_frame(summary, metric_name=STABILITY_METRIC):
+    """Keep tile, bank, channel, and the 3-sigma stability column under metric_name."""
+    columns = ["tile", "bank", "channel", STABILITY_METRIC]
+    if summary is None or len(summary) == 0:
+        return pd.DataFrame(columns=["tile", "bank", "channel", metric_name])
+    missing = [name for name in columns if name not in summary.columns]
+    if missing:
+        raise ValueError(f"Stability summary is missing {missing}")
+    frame = summary.loc[:, columns].rename(columns={STABILITY_METRIC: metric_name})
+    return frame.reset_index(drop=True)
+
+
+def summarize_clm_stability(df, power_tgt_mw=8, skip_initial_s=60):
     """Reduce a stability dataframe to one row per tile, bank, and channel.
 
-    wavelength error is the mean of wavelength_error_nm.
-    power error is the mean of power_from_osa_dBm minus 10*log10(power_tgt_mw).
-    15 min power stability is 3 times the sample standard deviation of that
-    same power error. Fewer than two samples leaves the stability value empty.
+    Samples with et_s below skip_initial_s are left out before the means.
+    skip_initial_s of 0 keeps every sample. wavelength error is the mean of
+    wavelength_error_nm. power error is the mean of power_from_osa_dBm minus
+    10*log10(power_tgt_mw). 15 min power stability is 3 times the sample
+    standard deviation of that same power error. Fewer than two samples
+    leaves the stability value empty.
     """
-    metrics = ["wavelength error", "power error", "15 min power stability"]
+    metrics = ["wavelength error", "power error", STABILITY_METRIC]
     columns = ["tile", "bank", "channel", *metrics]
     if power_tgt_mw <= 0:
         raise ValueError("power_tgt_mw must be positive")
+    if skip_initial_s < 0:
+        raise ValueError("skip_initial_s must be zero or positive")
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=columns)
 
-    target_dbm = 10.0 * np.log10(float(power_tgt_mw))
     work = df.copy()
+    if skip_initial_s > 0 and "et_s" in work.columns:
+        elapsed = pd.to_numeric(work["et_s"], errors="coerce")
+        work = work[elapsed >= float(skip_initial_s)]
+    if len(work) == 0:
+        return pd.DataFrame(columns=columns)
+
+    target_dbm = 10.0 * np.log10(float(power_tgt_mw))
     work["power_error_dB"] = work["power_from_osa_dBm"] - target_dbm
     rows = []
     grouped = work.groupby(["idx_tile", "bank", "ch"], sort=True)
@@ -1960,7 +2663,7 @@ def summarize_clm_stability(df, power_tgt_mw=8):
             "channel": int(channel),
             "wavelength error": float(group["wavelength_error_nm"].mean()),
             "power error": float(power_error.mean()),
-            "15 min power stability": (
+            STABILITY_METRIC: (
                 None if pd.isna(deviation) else float(3.0 * deviation)
             ),
         })
@@ -1980,14 +2683,25 @@ def clm_power_and_frequency_test(
     prepare_tile=True,
     data_dir=None,
     power_tgt_mw=None,
+    serial_number="",
+    skip_initial_s=60,
     note="",
     log=print,
+    mux_dither=None,
+    csv_stem=None,
+    plot="power_and_frequency",
+    plot_heading="",
+    log_name="Power and frequency",
 ):
     """Run power and wavelength stability on one tile and summarize results.
 
     Optionally initializes the tile, enables all channels, and waits settle_s
     after fire-up. Coupler OSA path losses come from load_clm_to_OSA_OPM_loss.
-    Returns ``(raw_df, summary_df)`` where summary matches summarize_clm_stability.
+    mux_dither True or False is written on both banks after that prepare step
+    and before the first sample. None leaves the dither bit unchanged.
+    Pass/fail numbers omit samples before skip_initial_s. The saved CSV and
+    plot keep the full trace. plot is ``power_and_frequency`` or ``power``.
+    Returns ``(raw_df, summary_df)``.
     """
     if tile is None:
         raise ValueError("tile handle is required")
@@ -2001,13 +2715,17 @@ def clm_power_and_frequency_test(
         spec = load_test_spec()
         power_tgt_mw = float(spec.get("clm_test_spec", {}).get("target_power", 8))
 
+    if plot not in ("power_and_frequency", "power"):
+        raise ValueError("plot must be 'power_and_frequency' or 'power'")
     label = f"tile {tile_index}"
-    log(f"Power and frequency test {label}" + (f" ({note})" if note else ""))
+    log(f"{log_name} test {label}" + (f" ({note})" if note else ""))
 
     if prepare_tile:
         tile = prepare_tile_mission(
             tb, tile, cfg, tile_index=tile_index, settle_s=settle_s, log=log
         )
+    if mux_dither is not None:
+        set_mux_dither_enable(tile, mux_dither, log=log)
 
     losses = load_clm_to_OSA_OPM_loss(cfg)
     raw_df = clm_power_n_wavelength_stability(
@@ -2021,15 +2739,49 @@ def clm_power_and_frequency_test(
         idx_tile=int(tile_index),
     )
     if data_dir and len(raw_df):
-        save_run(
+        stem = csv_stem or f"clm_power_n_wavelength_stability_tile{tile_index}"
+        csv_path = save_run(
             raw_df,
             data_dir,
-            f"clm_power_n_wavelength_stability_tile{tile_index}",
+            stem,
             params={"note": note, "tile_index": tile_index},
         )
+        log(f"{log_name} CSV: {csv_path}")
+        try:
+            import clm_plots as plots
 
-    summary = summarize_clm_stability(raw_df, power_tgt_mw=power_tgt_mw)
-    print(f"Power and frequency summary {label}:\n{summary}")
+            if plot == "power":
+                plot_path = plots.plot_power_vs_time(
+                    raw_df,
+                    output_dir=data_dir,
+                    file_stem=csv_path.stem,
+                    show=False,
+                    serial_number=serial_number,
+                    tile_index=tile_index,
+                    heading=plot_heading or "power vs time",
+                )
+            else:
+                plot_path = plots.plot_power_and_frequency(
+                    raw_df,
+                    output_dir=data_dir,
+                    file_stem=csv_path.stem,
+                    show=False,
+                    serial_number=serial_number,
+                    tile_index=tile_index,
+                )
+            log(f"{log_name} plot: {plot_path}")
+        except Exception as exc:
+            log(f"WARNING: {log_name} plot save failed: {exc}")
+
+    if skip_initial_s > 0:
+        log(
+            f"Pass/fail uses samples with elapsed time >= {skip_initial_s:g}s "
+            f"on {label}."
+        )
+    summary = summarize_clm_stability(
+        raw_df, power_tgt_mw=power_tgt_mw, skip_initial_s=skip_initial_s
+    )
+    print(f"{log_name} summary {label}:\n{summary}")
     return raw_df, summary
 
 
@@ -2144,26 +2896,27 @@ def per_over_temp_3_dual_meter(
     channels=range(LANES_PER_BANK),
     temp0=25,
     temp1=45,
-    channel_s=600,
+    channel_s=300,
     channel_settle_s=20,
     ramp_step_s=1.0,
     tile_index=None,
     note="",
     log=print,
 ):
-    """PER vs Arroyo triangle ramp with both meters at once.
+    """PER vs Arroyo one-way ramp with both meters at once.
 
-    For each channel index, enables bank-A and bank-B lanes together.
-    ``per_meter`` (ER-1000) records bank A; ``per_meter_er100`` records bank B.
-    Thorlabs TEC is not used.
+    Even channels ramp temp0 to temp1. Odd channels ramp temp1 to temp0.
+    Each ramp lasts channel_s. For each channel index, enables bank-A and
+    bank-B lanes together. ``per_meter`` (ER-1000) records bank A;
+    ``per_meter_er100`` records bank B. Thorlabs TEC is not used.
     """
     channels = list(channels)
     if channel_s <= 0:
         raise ValueError("channel_s must be positive")
     if channel_settle_s < 0:
         raise ValueError("channel_settle_s must be zero or positive")
-    if ramp_step_s <= 0 or ramp_step_s > channel_s / 2:
-        raise ValueError("ramp_step_s must be positive and no more than channel_s / 2")
+    if ramp_step_s <= 0 or ramp_step_s > channel_s:
+        raise ValueError("ramp_step_s must be positive and no more than channel_s")
     columns = [
         "time", "et_0", "et_chEnb", "et_tecAdj", "temp_tgt",
         "temp", "temp_thorlab", "temp_arroyo",
@@ -2180,8 +2933,17 @@ def per_over_temp_3_dual_meter(
             meter.stop(flush=True)
             meter.set_mode("er")
             meter.set_capture(True)
-        set_temperature_arroyo(tec_arroyo, temp0)
+        ensure_arroyo_tec_enabled(tec_arroyo, log=log)
+        if channels:
+            first_start, _first_end = channel_ramp_limits(channels[0], temp0, temp1)
+            set_temperature_arroyo(tec_arroyo, first_start)
         for channel in tqdm(channels, desc="channel"):
+            ramp_start, ramp_end = channel_ramp_limits(channel, temp0, temp1)
+            set_temperature_arroyo(tec_arroyo, ramp_start)
+            log(
+                f"ch={channel} ramp {ramp_start:.1f} -> {ramp_end:.1f} C "
+                f"over {channel_s:.0f}s"
+            )
             # Bank A and bank B same channel index, both meters live.
             mca.clm_lane_enable(
                 tile,
@@ -2203,13 +2965,15 @@ def per_over_temp_3_dual_meter(
             ramp_mark = time.monotonic()
             t_tec = time.time()
             next_write = ramp_mark
-            commanded = float(temp0)
+            commanded = float(ramp_start)
             while True:
                 elapsed = time.monotonic() - ramp_mark
                 if elapsed >= channel_s:
                     break
                 if time.monotonic() >= next_write:
-                    commanded = triangle_setpoint(elapsed, channel_s, temp0, temp1)
+                    commanded = one_way_setpoint(
+                        elapsed, channel_s, ramp_start, ramp_end
+                    )
                     set_temperature_arroyo(tec_arroyo, commanded)
                     next_write = time.monotonic() + ramp_step_s
                 remain = channel_s - (time.monotonic() - ramp_mark)
@@ -2246,8 +3010,9 @@ def per_over_temp_3_dual_meter(
                         f"T={commanded:.2f} "
                         f"A_samples={len(readings_a)} B_samples={len(readings_b)}"
                     )
-            set_temperature_arroyo(tec_arroyo, temp0)
+            set_temperature_arroyo(tec_arroyo, ramp_end)
             _lanes_off(tile)
+        set_temperature_arroyo(tec_arroyo, temp0)
     except KeyboardInterrupt:
         log(f"Interrupted. Partial data: {path}")
     except Exception:
@@ -2282,10 +3047,11 @@ def clm_per_test_dual_meter(
     channels=range(LANES_PER_BANK),
     temp0=25,
     temp1=45,
-    channel_s=600,
+    channel_s=300,
     channel_settle_s=20,
     ramp_step_s=1.0,
     tile_index=None,
+    serial_number="",
     prepare_tile=True,
     settle_s=30,
     note="",
@@ -2293,7 +3059,8 @@ def clm_per_test_dual_meter(
 ):
     """Acceptance PER: Arroyo-only ramp, dual meters, one fiber-confirm popup.
 
-    Disables all channels, prompts for A→ER-1000 and B→ER-100, then runs
+    After tile init, enables MUX dither on both banks. Then disables all
+    channels, prompts for A→ER-1000 and B→ER-100, and runs
     per_over_temp_3_dual_meter. Returns ``(raw_df, per_summary_df)``.
     """
     if tile is None:
@@ -2306,14 +3073,17 @@ def clm_per_test_dual_meter(
         tile_index = cfg.get("tile_index")
 
     log(f"PER dual-meter test tile {tile_index}" + (f" ({note})" if note else ""))
+    ensure_arroyo_tec_enabled(tec_arroyo, log=log)
     if prepare_tile:
         if cfg is None or tb is None:
             raise ValueError("prepare_tile requires tb and cfg")
         tile = prepare_tile_mission(
             tb, tile, cfg, tile_index=tile_index, settle_s=settle_s, log=log
         )
+        set_mux_dither_enable(tile, True, log=log)
 
     _lanes_off(tile)
+    log("All 16 channels are off.")
     if not _ask_per_fibers_dual():
         log("PER fiber hookup cancelled (No or dialog closed). Skipping PER.")
         empty = pd.DataFrame()
@@ -2357,6 +3127,9 @@ def clm_per_test_dual_meter(
                     output_dir=data_dir,
                     file_stem=stem,
                     show=False,
+                    serial_number=serial_number,
+                    tile_index=tile_index,
+                    bank=bank_name,
                 )
                 paths = result[1] if isinstance(result, tuple) else []
                 for path in paths:

@@ -419,8 +419,12 @@ def generate_clm_test_report(
     spec_config=None,
     results=None,
     output_dir=".",
+    file_suffix="",
 ) -> dict[str, Path]:
-    """Write the CLM report and return the docx, html, and pdf paths."""
+    """Write the CLM report and return the docx, html, and pdf paths.
+
+    ``file_suffix`` is appended to the file stem, before the extension.
+    """
     spec_config = spec_config_dict if spec_config is None else spec_config
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -428,7 +432,7 @@ def generate_clm_test_report(
     tables = build_all_results(spec_config, results)
     doc = build_docx(dict_test, dut, tables, spec_config)
 
-    stem = report_stem(dut["Serial Number"], dict_test["test date"])
+    stem = report_stem(dut["Serial Number"], dict_test["test date"]) + str(file_suffix or "")
     docx_path = (output_dir / f"{stem}.docx").resolve()
     try:
         doc.save(docx_path)

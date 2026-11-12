@@ -107,9 +107,10 @@ Check only the tests you need for this run.
 | **FW upgrade** | Flashes tile firmware from `clm_test_spec.yaml`. | Testboard / tile reachable. |
 | **Tap ratio (re-)calibration using OSA** | Compares PIC and MUX (aux) power to OSA through the coupler; updates tap ratios and writes a CLM config YAML. Includes ~60 s settle after channels fire up. | OSA + coupler fibers. Laser-safety fiber prompt. |
 | **power and frequency** | ~15 minute power and wavelength stability via OSA; feeds the test report. | OSA + coupler fibers. If tap cal is also selected in the same run, the tile is not re-initialized for this test. |
+| **power and frequency with MUX dither off** | Turns MUX dither off on both banks, then collects the same OSA data for 6 minutes. The report section is power stability with MUX dither off, using the power stability limit. | OSA + coupler fibers. If tap cal or power and frequency is also selected, the tile is not re-initialized. |
 | **PER** | Polarization extinction vs Arroyo temperature ramp (about 25–45 °C). Bank A uses ER-1000; bank B uses ER-100. | Arroyo TEC + both PER meters; PER fiber paths. |
 
-Typical full acceptance order: FW upgrade → tap ratio → power and frequency → PER (select all that apply).
+For each tile in **Tile index(es)**, the selected tests run in this order, then the next tile starts: FW upgrade → tap ratio → power and frequency → power and frequency with MUX dither off → PER.
 
 ---
 
@@ -120,12 +121,12 @@ Typical full acceptance order: FW upgrade → tap ratio → power and frequency 
 3. On **Acceptance test**, check the tests to run.  
 4. Click **Run selected tests**.  
 
-**Laser safety popup** (when tap and/or power and frequency are selected):
+**Laser safety popup** (once per tile, just before that tile's tap-ratio, power and frequency, or MUX dither off test):
 
-> please connect DUT output to coupler input (A→white, B→blue).
+> Tile N: please connect DUT output to coupler input (A→white, B→blue).
 
-- Click **Yes** only after fibers are connected correctly.  
-- Click **No** (or close the dialog) to cancel — no tests run.
+- Click **Yes** only after that tile's fibers are connected correctly.  
+- Click **No** (or close the dialog) to stop. Tests already finished on earlier tiles are kept. If nothing has run yet, the test station stays open.
 
 While tests run, watch the **Log** for:
 
@@ -155,9 +156,10 @@ Typical contents (depending on which tests ran):
 - PER plots (PNG)  
 - CLM config YAML (after tap calibration)  
 - `operator_note.txt` (if Comment was filled in)  
+- `acceptance_log_{DUT_SN}_{mm-dd-yyyy}_{hh-mm-ss}.txt` — the Log pane text, written when the run finishes or fails  
 - Test report files (docx / html / pdf) when power/frequency and/or PER produced reportable metrics  
 
-Pass/fail limits for the report come from **`clm_test_spec.yaml`** (wavelength error, power error, power stability, PER).
+Pass/fail limits for the report come from **`clm_test_spec.yaml`** (wavelength error, power error, power stability, PER). Power stability with MUX dither off uses the same power stability window on the 6 minute dither-off data.
 
 ---
 
@@ -183,7 +185,7 @@ Pass/fail limits for the report come from **`clm_test_spec.yaml`** (wavelength e
 | Laser safety cancelled / no tests run | You clicked No or closed the popup. Reconnect fibers and run again, choose Yes. |
 | “Busy” / another action still running | Wait for the current start/close/run to finish. |
 | Instrument unavailable in Log | Check power, USB/COM/VISA cables, and that the instrument is free (not open in another program). Restart **Start test station**. |
-| Report skipped | Only power/frequency and PER feed the report. If neither produced summary data, no report is written. |
+| Report skipped | Power/frequency, MUX dither off, and PER feed the report. If none of them produced summary data, no report is written. |
 | Wrong tile or no response | Confirm **Tile index(es)** matches the physical tile under test. |
 
-If problems continue, capture the Log text and contact the lab engineer who maintains `lab_config.yaml` and `clm_test_spec.yaml`.
+If problems continue, use the saved `acceptance_log_*.txt` in the results folder and contact the lab engineer who maintains `lab_config.yaml` and `clm_test_spec.yaml`.

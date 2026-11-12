@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 
@@ -19,6 +20,153 @@ def _load(df_or_path):
     if "et_s" in frame.columns and "et_h" not in frame.columns:
         frame["et_h"] = frame["et_s"] / 3600
     return frame
+
+
+def _prepare_power_frame(df_or_path):
+    """Elapsed minutes, integer channel, and CLM power in dBm."""
+    frame = _load(df_or_path)
+    if "et_min" not in frame.columns and "et_s" in frame.columns:
+        frame["et_min"] = frame["et_s"] / 60.0
+    if "ch" in frame.columns:
+        frame["ch"] = pd.to_numeric(frame["ch"], errors="coerce").astype(int)
+    if "clm_power_uW" in frame.columns:
+        power_uw = pd.to_numeric(frame["clm_power_uW"], errors="coerce")
+        frame["clm_reported_power_dbm"] = np.where(
+            power_uw > 0, 10.0 * np.log10(power_uw / 1000.0), np.nan
+        )
+    return frame
+
+
+def _plot_metric_grid(frame, metrics, serial_number, tile_index, figsize, heading=""):
+    """One row per metric, bank A and bank B side by side, versus elapsed time.
+
+    A metric is (column, ylabel, per_channel). per_channel draws one line per
+    channel. A tile-level value such as T_PIC is drawn as one line.
+    """
+    n_rows = len(metrics)
+    fig, axes = plt.subplots(n_rows, 2, figsize=figsize, sharex=True)
+    axes = np.atleast_2d(axes)
+    for row, (column, ylabel, per_channel) in enumerate(metrics):
+        for col, bank in enumerate(("A", "B")):
+            ax = axes[row, col]
+            subset = frame[frame["bank"].astype(str) == bank] if "bank" in frame.columns else frame
+            if column in subset.columns and not subset.empty:
+                if per_channel:
+                    sns.lineplot(
+                        data=subset,
+                        x="et_min",
+                        y=column,
+                        hue="ch",
+                        palette="bright",
+                        ax=ax,
+                        legend=(col == 1),
+                    )
+                else:
+                    series = subset.groupby("et_min", as_index=False)[column].mean()
+                    sns.lineplot(
+                        data=series, x="et_min", y=column, ax=ax, legend=False
+                    )
+            ax.set_title(_per_plot_heading("", serial_number, tile_index, bank))
+            ax.set_ylabel(ylabel)
+            ax.set_xlabel("elapsed time (min)")
+            ax.grid(True)
+            if col == 1 and ax.get_legend() is not None:
+                ax.legend(title="ch", loc="center left", bbox_to_anchor=(1.02, 0.5))
+    if str(heading).strip():
+        fig.suptitle(str(heading).strip())
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+    else:
+        fig.tight_layout()
+    return fig
+
+
+def _save_or_show(fig, output_dir, filename, show):
+    path = None
+    if output_dir is not None:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / filename
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return path
+
+
+def _bias_metrics(frame):
+    """LD, VOA, and PIC temperature rows when those columns are present."""
+    metrics = []
+    if "LD_mA" in frame.columns:
+        metrics.append(("LD_mA", "LD bias (mA)", True))
+    if "VOA_mA" in frame.columns:
+        metrics.append(("VOA_mA", "VOA bias (mA)", True))
+    if "T_PIC" in frame.columns:
+        metrics.append(("T_PIC", "T_PIC (C)", False))
+    return metrics
+
+
+def plot_power_and_frequency(
+    df_or_path,
+    output_dir=None,
+    file_stem="power_and_frequency",
+    show=True,
+    serial_number=None,
+    tile_index=None,
+):
+    """OSA power, CLM power, wavelength error, LD, VOA, and T_PIC versus time.
+
+    CLM power is ``clm_power_uW`` converted to dBm. LD and VOA are one line
+    per channel. T_PIC is one line for the tile. One column per bank.
+    When ``output_dir`` is set, saves ``{file_stem}_power_freq.png``.
+    """
+    frame = _prepare_power_frame(df_or_path)
+    metrics = [
+        ("power_from_osa_dBm", "channel power (dBm)", True),
+        ("clm_reported_power_dbm", "clm reported power (dbm)", True),
+        ("wavelength_error_nm", "wavelength error (nm)", True),
+        *_bias_metrics(frame),
+    ]
+    fig = _plot_metric_grid(
+        frame,
+        metrics,
+        serial_number,
+        tile_index,
+        figsize=(12, 3.4 * len(metrics)),
+    )
+    return _save_or_show(fig, output_dir, f"{file_stem}_power_freq.png", show)
+
+
+def plot_power_vs_time(
+    df_or_path,
+    output_dir=None,
+    file_stem="power_vs_time",
+    show=True,
+    serial_number=None,
+    tile_index=None,
+    heading="power vs time",
+):
+    """OSA power, CLM power, LD, VOA, and T_PIC versus elapsed time.
+
+    CLM power is ``clm_power_uW`` converted to dBm. LD and VOA are one line
+    per channel. T_PIC is one line for the tile. One column per bank.
+    When ``output_dir`` is set, saves ``{file_stem}_power.png``.
+    """
+    frame = _prepare_power_frame(df_or_path)
+    metrics = [
+        ("power_from_osa_dBm", "channel power (dBm)", True),
+        ("clm_reported_power_dbm", "clm reported power (dbm)", True),
+        *_bias_metrics(frame),
+    ]
+    fig = _plot_metric_grid(
+        frame,
+        metrics,
+        serial_number,
+        tile_index,
+        figsize=(12, 3.4 * len(metrics)),
+        heading=heading,
+    )
+    return _save_or_show(fig, output_dir, f"{file_stem}_power.png", show)
 
 
 def plot_power_stability(df_or_path, power_targets=(12, 10, 8), p_ylim=(6000, 14000)):
@@ -63,6 +211,75 @@ def _line_by_condition(subset, y_column, title, ylim):
         ax.set_ylim(ylim)
     fig.tight_layout()
     plt.show()
+
+
+def _channels_long(frame, prefix, time_col):
+    """Stack bank lanes into one value column labeled ch0..ch15."""
+    pieces = []
+    for bank in (0, 1):
+        subset = frame[frame["bank"] == bank]
+        for channel in range(8):
+            column = f"{prefix}{channel}"
+            piece = subset[[time_col, column]].copy()
+            piece = piece.rename(columns={column: "value"})
+            piece["channel"] = f"ch{bank * 8 + channel}"
+            pieces.append(piece)
+    long = pd.concat(pieces, ignore_index=True)
+    long["channel"] = pd.Categorical(
+        long["channel"],
+        categories=[f"ch{i}" for i in range(16)],
+        ordered=True,
+    )
+    return long
+
+
+def _plot_channel_traces(frame, prefix, ylabel, title, time_col):
+    long = _channels_long(frame, prefix, time_col)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sns.lineplot(
+        data=long,
+        x=time_col,
+        y="value",
+        hue="channel",
+        palette="bright",
+        linewidth=1,
+        ax=ax,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("elapsed time (s)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True)
+    ax.legend(ncol=2, fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_power_level_sweep(df_or_path):
+    """PIC temperature, channel power, LD bias, and VOA bias versus time.
+
+    T_PIC is taken from bank 0 because the same tile temperature is stored
+    on both bank rows. Channel traces use et_run_s when the sweep stitched
+    dwells onto one clock.
+    """
+    frame = _load(df_or_path)
+    if frame.empty:
+        print("No samples to plot.")
+        return frame
+    time_col = "et_run_s" if "et_run_s" in frame.columns else "et_s"
+    pic = frame[frame["bank"] == 0]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    sns.lineplot(data=pic, x=time_col, y="T_PIC", ax=ax)
+    ax.set_title("PIC temperature")
+    ax.set_xlabel("elapsed time (s)")
+    ax.set_ylabel("T_PIC (C)")
+    ax.grid(True)
+    fig.tight_layout()
+    plt.show()
+
+    _plot_channel_traces(frame, "p_mon", "power monitor", "channel power", time_col)
+    _plot_channel_traces(frame, "I_LD", "LD bias (mA)", "LD bias", time_col)
+    _plot_channel_traces(frame, "I_VOA", "VOA bias (mA)", "VOA bias", time_col)
+    return frame
 
 
 def plot_thermal_watch(df_or_path):
@@ -138,22 +355,73 @@ def plot_per_meter_cal(df_or_path):
     return frame
 
 
+def _per_bank_label(bank):
+    """Bank 0/1 is written as A/B. A and B are kept as given."""
+    text = str(bank).strip()
+    if text.upper() in ("A", "B"):
+        return text.upper()
+    try:
+        as_int = int(float(text))
+    except (TypeError, ValueError):
+        return text
+    return {0: "A", 1: "B"}.get(as_int, text)
+
+
+def _per_plot_heading(kind, serial_number=None, tile_index=None, bank=None):
+    """``PER vs time — <sn>, tile <idx>, bank <A|B>``."""
+    bits = []
+    serial = "" if serial_number is None else str(serial_number).strip()
+    if serial:
+        bits.append(serial)
+    if tile_index is not None and str(tile_index).strip() != "":
+        try:
+            as_int = int(tile_index)
+            if float(tile_index) == as_int:
+                tile_index = as_int
+        except (TypeError, ValueError):
+            pass
+        bits.append(f"tile {tile_index}")
+    if bank is not None and str(bank).strip() != "":
+        bits.append(f"bank {_per_bank_label(bank)}")
+    if not bits:
+        return kind
+    identity = ", ".join(bits)
+    if not str(kind).strip():
+        return identity
+    return f"{kind} — {identity}"
+
+
 def plot_per_vs_temperature(
     df_or_path,
     output_dir=None,
     file_stem="per_vs_temperature",
     show=True,
+    serial_number=None,
+    tile_index=None,
+    bank=None,
 ):
     """PER / theta / temp versus time, then PER versus theta.
 
     When ``output_dir`` is set, saves:
       ``{file_stem}_time.png`` and ``{file_stem}_theta.png``.
+    Titles include serial number, tile index, and bank when those are given.
+    Tile index and bank fall back to a single value in those frame columns.
     """
     frame = _load(df_or_path)
     if "et_min" not in frame.columns and "et_0" in frame.columns:
         frame["et_min"] = frame["et_0"] / 60.0
     if "et_min" not in frame.columns and "et_s" in frame.columns:
         frame["et_min"] = frame["et_s"] / 60.0
+    if tile_index is None and "tile_index" in frame.columns:
+        tile_values = frame["tile_index"].dropna().unique()
+        if len(tile_values) == 1:
+            tile_index = tile_values[0]
+    if bank is None and "bank" in frame.columns:
+        bank_values = frame["bank"].dropna().unique()
+        if len(bank_values) == 1:
+            bank = bank_values[0]
+    time_title = _per_plot_heading("PER vs time", serial_number, tile_index, bank)
+    theta_title = _per_plot_heading("PER vs theta", serial_number, tile_index, bank)
     # Arroyo-only runs may leave temp_thorlab empty; prefer temp then temp_arroyo.
     temp_col = "temp"
     if temp_col not in frame.columns or frame[temp_col].isna().all():
@@ -187,7 +455,8 @@ def plot_per_vs_temperature(
     ax[2].set_xlabel("et_min")
     for axis in ax:
         axis.grid(True)
-    fig.tight_layout()
+    fig.suptitle(time_title)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     paths = []
     if out is not None:
         path_time = out / f"{file_stem}_time.png"
@@ -204,6 +473,7 @@ def plot_per_vs_temperature(
     )
     ax.set_xlabel("polarization angle (deg)")
     ax.set_ylabel("PER (dB)")
+    ax.set_title(theta_title)
     ax.grid(True)
     fig.tight_layout()
     if out is not None:

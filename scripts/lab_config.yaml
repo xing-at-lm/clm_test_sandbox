@@ -37,6 +37,8 @@ arroyo_port: COM3
 dmm_visa: USB0::0x2A8D::0xB318::MY65070041::INSTR
 psu_visa: USB0::0x2A8D::0x1202::MY61007909::INSTR
 osa_visa: TCPIP0::169.254.236.114::inst0::INSTR
+# Keysight N7745C. Not opened with the test station; the instrument self test opens it.
+opm_visa: TCPIP::100.65.87.253::INSTR
 
 thorlabs_sdk: C:\Program Files (x86)\Thorlabs\PTC1\Sample\Thorlabs_PTC1_PythonSDK
 
